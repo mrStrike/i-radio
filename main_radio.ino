@@ -7,6 +7,7 @@
 #include <Arduino.h>
 #include <Wire.h>
 #include <WiFi.h>
+#include <esp_http_server.h>
 #include <Preferences.h>
 #include <WiFiManager.h>
 #include <LovyanGFX.hpp>
@@ -238,6 +239,7 @@ static uint16_t* dmaLine = nullptr;
 static lv_obj_t* mainScreen = nullptr;
 static lv_obj_t* listScreen = nullptr;
 static lv_obj_t* settingsScreen = nullptr;
+static lv_obj_t* remoteAddressLabel = nullptr;
 static lv_obj_t* wifiScreen = nullptr;
 static lv_obj_t* volumeSlider = nullptr;
 static lv_obj_t* volumeLabel = nullptr;
@@ -255,6 +257,9 @@ static lv_obj_t* batteryUnknown = nullptr;
 static lv_obj_t* tileBtns[STATION_COUNT];
 static lv_obj_t* tileLabels[STATION_COUNT];
 static char currentStatus[96] = "Нажмите плитку";
+// Копию статуса для веб-пульта защищаю отдельно: HTTP не обращается к LVGL.
+static portMUX_TYPE webStatusMux = portMUX_INITIALIZER_UNLOCKED;
+static char webStatus[96] = "Нажмите плитку";
 static volatile int currentStation = -1;
 static volatile bool isPlaying = false;
 static volatile bool testToneActive = false;
@@ -276,6 +281,11 @@ static const char* sleepNames[] = {
     "0: сон выключен", "1: через 2 минуты", "2: через 5 минут", "3: через 10 минут", "4: через 15 минут", "5: через 30 минут", "6: через час"
 };
 static lv_obj_t* sleepLabel = nullptr;
+static lv_obj_t* brightnessSlider = nullptr;
+static lv_obj_t* displaySleepSlider = nullptr;
+// Команды настроек исполняю только в GUI-задаче.
+struct RemoteSetting { int kind; int value; };
+static QueueHandle_t remoteSettingsQueue = nullptr;
 static uint32_t lastTouchAt = 0;
 static bool displaySleeping = false;
 static bool suppressWakeTouch = false;
@@ -321,11 +331,8 @@ static void radioTimerEvent(lv_event_t* e) {
     lv_label_set_text(timerLabel,b);
 }
 // Меняю только состав четырёх избранных станций, не запускаю звук и не закрываю список. Если все места заняты, пятый выбор не принимаю; затем согласовываю все чекбоксы и подписи плиток.
-static void favoriteEvent(lv_event_t* e) {
-    int id = int(uintptr_t(lv_event_get_user_data(e)));
+static void changeFavorite(int id, bool requested) {
     if(id < 0 || id >= ALL_STATIONS_COUNT) return;
-    // LVGL toggles the checkbox before VALUE_CHANGED is delivered.
-    bool requested = lv_obj_has_state((lv_obj_t*)lv_event_get_target(e), LV_STATE_CHECKED);
     int slot = -1, empty = -1;
     for(int j=0;j<4;j++) {
         int n = favoriteIds[j].load();
@@ -355,6 +362,10 @@ static void favoriteEvent(lv_event_t* e) {
         int n=favoriteIds[j].load();
         setTileText(tileLabels[j], n>=0 ? ALL_STATIONS[n].name : "Не выбрано",96);
     }
+}
+static void favoriteEvent(lv_event_t* e) {
+    changeFavorite(int(uintptr_t(lv_event_get_user_data(e))),
+        lv_obj_has_state((lv_obj_t*)lv_event_get_target(e), LV_STATE_CHECKED));
 }
 static Preferences radioPrefs;
 static int savedStation = -1;
@@ -1047,6 +1058,7 @@ static void buildSettingsScreen() {
     lv_obj_set_style_text_color(brightnessLabel, lv_color_hex(0x4fc3f7), 0);
     lv_obj_align(brightnessLabel, LV_ALIGN_TOP_RIGHT, -16, 100);
     lv_obj_t* slider = lv_slider_create(settingsScreen);
+    brightnessSlider = slider;
     lv_obj_set_pos(slider, 16, 128);
     lv_obj_set_size(slider, 208, 12);
     lv_slider_set_range(slider, 15, 100);
@@ -1062,6 +1074,7 @@ static void buildSettingsScreen() {
     lv_obj_set_pos(sleepLabel, 16, 174);
     lv_label_set_text(sleepLabel, sleepNames[sleepChoice.load()]);
     lv_obj_t* sleepSlider = lv_slider_create(settingsScreen);
+    displaySleepSlider = sleepSlider;
     lv_obj_set_pos(sleepSlider, 16, 204);
     lv_obj_set_size(sleepSlider, 208, 12);
     lv_slider_set_range(sleepSlider, 0, 6);
@@ -1123,6 +1136,12 @@ static void buildSettingsScreen() {
     lv_obj_set_style_text_align(authorText, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(authorText, "Автор и разработчик:\nБорисенко Д.А.\nг.Краснодон, ЛНР,\n2026 год.");
     lv_obj_align(authorText, LV_ALIGN_CENTER, 0, -24);
+    // В окне информации показываю адрес пульта, не перестраивая настройки.
+    remoteAddressLabel = mustLabel(authorPanel, "remoteAddress");
+    lv_obj_set_width(remoteAddressLabel, 224);
+    lv_obj_set_style_text_align(remoteAddressLabel, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_pos(remoteAddressLabel, 8, 205);
+    lv_label_set_text(remoteAddressLabel, "Веб-пульт: нет Wi-Fi");
     lv_obj_t* closeAuthor = mustButton(authorPanel, "closeAuthor");
     lv_obj_set_size(closeAuthor, 160, 40);
     lv_obj_align(closeAuthor, LV_ALIGN_BOTTOM_MID, 0, -28);
@@ -1234,21 +1253,63 @@ static void refreshUi() {
         char b[16];
         snprintf(b, sizeof(b), "%d%%", currentVolume.load() * 100 / 21);
         lv_label_set_text(volumeLabel, b);
+        lv_slider_set_value(volumeSlider, currentVolume.load(), LV_ANIM_OFF);
     }
     const char* toneText = testToneActive ? "Тестовый тон: ВКЛ" : "Тестовый тон: ВЫКЛ";
     if (toneLabel && strcmp(lv_label_get_text(toneLabel), toneText))
     lv_label_set_text(toneLabel, toneText);
     if (statusLabel && strcmp(lv_label_get_text(statusLabel), currentStatus)) lv_label_set_text(statusLabel, currentStatus);
 }
+// Отмечаю получение декодированного блока, а не просто открытого соединения.
+// Не изменяю сэмплы и разрешаю библиотеке продолжить обычную передачу в I2S.
+// Этот признак подтверждает обработку аудиоданных, но не звук из динамика.
+static std::atomic<uint32_t> lastDecodedAudioAt{0};
+void audio_process_extern(int16_t* buff, uint16_t len, bool* continueI2S) {
+    (void)buff;
+    if (len) lastDecodedAudioAt.store(millis());
+    *continueI2S = true;
+}
+
+
+// В ESP32-audioI2S 4.0.1 отмечаю блок через актуальный обработчик.
+// Он вызывается до регулировки громкости: нулевая громкость и тишина
+// в эфире не должны выглядеть как обрыв. Сэмплы оставляю без изменений.
+// Старый обработчик выше сохраняю для закреплённой сборки Schematik.
+void audio_process_raw_samples(int32_t* outBuff, int16_t validSamples) {
+    (void)outBuff;
+    if (validSamples > 0) lastDecodedAudioAt.store(millis());
+}
+
+#include "web_remote.h"
+
 /* ---------- Audio task ---------- */
 #include "audio_pinout.h"
+// Сохраняю пользовательскую шкалу 0–21 для экрана, пульта и памяти.
+// Компенсирую квадратичную кривую библиотеки квадратным корнем:
+// выбранная доля шкалы становится примерно такой же долей амплитуды.
+// Использую 255 внутренних шагов, чтобы уменьшить погрешность округления.
+static void applyLinearVolume(Audio& audio, int selected) {
+    const int level = constrain(selected, 0, 21);
+    const uint8_t internal = static_cast<uint8_t>(lroundf(255.0f * sqrtf(level / 21.0f)));
+    audio.setVolume(internal, 0);
+}
+
 // В этой задаче владею объектом Audio: обрабатываю команды, обслуживаю поток, сохраняю настройки и повторяю подключение. GUI общается с ней через очереди и общие значения, не обращаясь к Audio напрямую.
 void audio_task(void*) {
     LOG("AUDIO", "task start (stack 20K)");
     Audio audio;
+#if ESP_ARDUINO_VERSION_MAJOR >= 4
+    // На ядре ESP32 4 использую API новой аудиобиблиотеки: декодер
+    // обслуживаю на ядре 0, оставляя ядро 1 интерфейсу и сенсору.
+    audio.setAudioTaskCore(0);
+#endif
     if (!configureAudioPins(audio, 0)) fatal("I2S pinout failed");
+    // Ограничиваю сетевое подключение: HTTP — 1 с, HTTPS — 3 с.
+    // DNS и внутренние операции платформы могут занимать дополнительное время.
+    audio.setConnectionTimeout(1000, 3000);
     audio.forceMono(true);
-    audio.setVolume(currentVolume);
+    audio.setVolumeSteps(255);
+    applyLinearVolume(audio, currentVolume.load());
     LOG("I2S", "BCLK=%d LRCK=%d DOUT=%d MCLK=%d; PA_EN=%d (LOW=enabled); volume=%d/21", BCLK, LRCK, DOUT, MCLK, digitalRead(PA_EN), currentVolume.load());
     bool wasRunning = false;
     uint32_t toneStarts = 0;
@@ -1344,9 +1405,9 @@ void audio_task(void*) {
     // После открытия потока повторно применяю выбранную громкость — сохраняю проверенное исправление потери уровня при смене станции.
     auto applyStreamVolume = [&]() {
         const int requested = currentVolume.load();
-        audio.setVolume(requested);
+        applyLinearVolume(audio, requested);
         appliedVolume = requested;
-        LOG("VOLUME", "stream open: selected=%d/21 applied=%u/21", requested, unsigned(audio.getVolume()));
+        LOG("VOLUME", "stream open: selected=%d/21 applied=%u/255", requested, unsigned(audio.getVolume()));
     };
     int persistedBright = currentBrightness.load(), observedBright = persistedBright;
     int persistedSleep = sleepChoice.load(), observedSleep = persistedSleep;
@@ -1354,6 +1415,29 @@ void audio_task(void*) {
     // Повторные подключения начинаю с паузы 3 секунды и увеличиваю её до 30 секунд. wantPlayback отличает обрыв от намеренной остановки.
     uint32_t nextRetry=0;
     unsigned retryDelay=3000;
+    uint32_t streamOpenedAt = 0;
+    bool streamHadAudio = false;
+    constexpr uint32_t AUDIO_WAIT_MS = 12000;
+    // Начинаю каждую попытку с чистого признака аудио. Старый блок предыдущей
+    // станции не должен превратить новое соединение в «воспроизведение».
+    auto openRadioStream = [&](const char* url) {
+        lastDecodedAudioAt.store(0);
+        streamHadAudio = false;
+        streamOpenedAt = millis();
+        wasRunning = false;
+        isPlaying = false;
+        bool accepted = audio.connecttohost(url);
+        applyStreamVolume();
+        if (!accepted) {
+            streamOpenedAt = 0;
+            wantPlayback = false;
+            pushStatus("Нет соединения: выберите станцию");
+        } else {
+            pushStatus("Ожидание аудиоданных...");
+        }
+        nextRetry = millis() + retryDelay;
+        return accepted;
+    };
     for (;;) {
         // Записываю избранное вне GUI; прочие настройки сохраняю после секунды без изменений, а не на каждом движении ползунка.
         if(favoritesDirty.exchange(false)) for(int j=0;j<4;j++) {
@@ -1373,7 +1457,7 @@ void audio_task(void*) {
         }
         int desiredVolume = currentVolume.load();
         if (appliedVolume != desiredVolume) {
-            audio.setVolume(desiredVolume);
+            applyLinearVolume(audio, desiredVolume);
             appliedVolume = desiredVolume;
         }
         int bright = currentBrightness.load(), sleep = sleepChoice.load();
@@ -1401,22 +1485,29 @@ void audio_task(void*) {
         }
         Command c;
         if (xQueueReceive(audioCmdQueue, &c, 0) == pdTRUE) {
+            // Пока сервер отвечал, могло накопиться несколько нажатий.
+            // Выполняю последнее пожелание, а не подключаю все станции по очереди.
+            Command newer;
+            while (xQueueReceive(audioCmdQueue, &newer, 0) == pdTRUE) c = newer;
             LOG("AUDIO CMD", "received type=%d value=%u queued=%u", int(c.type), c.value, unsigned(uxQueueMessagesWaiting(audioCmdQueue)));
             if (c.type == CMD_SET_VOLUME) {
                 /* Legacy command: the atomic mailbox is authoritative. */
             }
             else if (c.type == CMD_TOGGLE) {
                 restorePending = false;
-                if(wantPlayback && !audio.isRunning()) {
+                if(wantPlayback && !isPlaying) {
                     wantPlayback=false;
                     audio.stopSong();
                     pushStatus("Пауза");
                 }
                 else if (currentStation >= 0 && audio.pauseResume()) {
-                    isPlaying = audio.isRunning();
-                    wantPlayback=isPlaying;
-                    wasRunning = isPlaying;
-                    pushStatus(isPlaying ? "Воспроизведение" : "Пауза");
+                    wantPlayback = audio.isRunning();
+                    // После возобновления снова жду свежий декодированный блок.
+                    lastDecodedAudioAt.store(0);
+                    streamOpenedAt = wantPlayback ? millis() : 0;
+                    isPlaying = false;
+                    wasRunning = false;
+                    pushStatus(wantPlayback ? "Ожидание аудиоданных..." : "Пауза");
                 }
             }
             else if (c.type == CMD_TEST_TONE) {
@@ -1480,18 +1571,17 @@ void audio_task(void*) {
                 else {
                     LOG("CONNECT", "%s | %s", name, url);
                     pushStatus("Подключение...");
-                    bool connected = audio.connecttohost(url);
-                    applyStreamVolume();
-                    if (!connected) pushStatus("Ошибка");
-                    else {
-                        isPlaying = true;
+                    if (openRadioStream(url)) {
                         if (savedUrl != url && radioPrefs.putString("station", url)) savedUrl = url;
-                        char b[64];
-                        snprintf(b, sizeof(b), "Играет: %s", name);
-                        pushStatus(b);
                     }
                 }
             }
+        }
+        // Не вхожу в очередное обслуживание старого потока, если уже есть
+        // команда пользователя: сначала переключаю станцию или ставлю паузу.
+        if (uxQueueMessagesWaiting(audioCmdQueue)) {
+            vTaskDelay(1);
+            continue;
         }
         audio.loop();
         bool running = audio.isRunning();
@@ -1509,23 +1599,51 @@ void audio_task(void*) {
             isPlaying=false;
             if(wasRunning) pushStatus("Нет сети: ожидание Wi-Fi");
         }
+        // Соединение может числиться работающим, но не давать аудиоблоков.
+        // Прерываю ожидание первого блока или длительный обрыв, оставляя паузу
+        // до следующей попытки. GUI по-прежнему работает в отдельной задаче.
+        uint32_t decodedAt = lastDecodedAudioAt.load();
+        if (decodedAt) streamHadAudio = true;
+        uint32_t audioReference = decodedAt ? decodedAt : streamOpenedAt;
+        if (wantPlayback && streamOpenedAt && millis() - audioReference >= AUDIO_WAIT_MS) {
+            audio.stopSong();
+            running = false;
+            isPlaying = false;
+            streamOpenedAt = 0;
+            lastDecodedAudioAt.store(0);
+            nextRetry = millis() + retryDelay;
+            retryDelay = min(retryDelay * 2, 30000U);
+            // Если станция ни разу не дала аудио, не запускаю её по кругу.
+            // Восстановление сохраняю только для уже игравшего потока.
+            if (!streamHadAudio) {
+                wantPlayback = false;
+                pushStatus("Нет аудиоданных: выберите станцию");
+            } else {
+                pushStatus("Обрыв аудио: повтор позже");
+            }
+        }
         // Переподключаюсь только при сохранённом намерении играть и доступном Wi-Fi. После открытия снова применяю текущую громкость.
         if(wantPlayback && !running && currentStation>=0 && WiFi.status()==WL_CONNECTED && int32_t(millis()-nextRetry)>=0) {
             const auto* station=selectedStation(currentStation);
             if(station) {
                 pushStatus("Переподключение...");
                 audio.stopSong();
-                audio.connecttohost(station->url);
-                applyStreamVolume();
+                openRadioStream(station->url);
             }
             nextRetry=millis()+retryDelay;
             retryDelay=min(retryDelay*2,30000U);
         }
-        if(running) retryDelay=3000;
-        if (running != wasRunning) {
-            wasRunning = running;
-            isPlaying = running;
-            if(running) pushStatus("Воспроизведение");
+        // Состояние интерфейса зависит от свежих декодированных блоков,
+        // а не от isRunning(), который включается уже при TCP-соединении.
+        decodedAt = lastDecodedAudioAt.load();
+        bool receivingAudio = wantPlayback && running && decodedAt &&
+                              millis() - decodedAt < AUDIO_WAIT_MS;
+        if (receivingAudio) retryDelay = 3000;
+        isPlaying = receivingAudio;
+        if (receivingAudio != wasRunning) {
+            wasRunning = receivingAudio;
+            if (receivingAudio) pushStatus("Воспроизведение");
+            else if (wantPlayback && running) pushStatus("Ожидание аудиоданных...");
         }
         vTaskDelay(1);
     }
@@ -1583,10 +1701,39 @@ void gui_task(void*) {
             portalReturnRequested = false;
             lv_screen_load(mainScreen);
         }
+        // Обрабатываю ограниченную очередь без ожидания сети или аудиопотока.
+        RemoteSetting setting;
+        if (remoteSettingsQueue && xQueueReceive(remoteSettingsQueue, &setting, 0) == pdTRUE) {
+            if (setting.kind == 0) {
+                setBrightness(setting.value);
+                lv_slider_set_value(brightnessSlider, setting.value, LV_ANIM_OFF);
+                char text[16]; snprintf(text,sizeof(text),"%d%%",setting.value);
+                lv_label_set_text(brightnessLabel,text);
+            } else if (setting.kind == 1) {
+                sleepChoice.store(setting.value);
+                lastTouchAt = millis();
+                lv_slider_set_value(displaySleepSlider,setting.value,LV_ANIM_OFF);
+                lv_label_set_text(sleepLabel,sleepNames[setting.value]);
+            } else if (setting.kind == 2) {
+                radioTimerChoice = setting.value;
+                int minutes = radioMinutes[setting.value];
+                radioDeadline.store(minutes ? millis()+minutes*60000UL : 0);
+                lv_slider_set_value(radioTimerSlider,setting.value,LV_ANIM_OFF);
+                char text[64];
+                if(minutes) snprintf(text,sizeof(text),"Радио: стоп через %d мин",minutes);
+                else snprintf(text,sizeof(text),"Таймер радио выключен");
+                lv_label_set_text(timerLabel,text);
+            } else {
+                changeFavorite(setting.value, setting.kind == 3);
+            }
+        }
         UiEvent e;
         if (xQueueReceive(uiEventQueue, &e, 0) == pdTRUE) {
             if (e.type == UI_STATUS) {
                 strlcpy(currentStatus, e.text, sizeof(currentStatus));
+                portENTER_CRITICAL(&webStatusMux);
+                strlcpy(webStatus, e.text, sizeof(webStatus));
+                portEXIT_CRITICAL(&webStatusMux);
             }
             else if (e.type == UI_METADATA) {
                 /* Metadata is not displayed yet. */
@@ -1599,6 +1746,13 @@ void gui_task(void*) {
         if (now - lastWifiCheck > 1000) {
             lastWifiCheck = now;
             updateWifiIndicator();
+            if (remoteAddressLabel) {
+                String address = WiFi.status() == WL_CONNECTED
+                    ? "Веб-пульт:\nhttp://" + WiFi.localIP().toString() + ":8080"
+                    : "Веб-пульт: нет Wi-Fi";
+                if (strcmp(lv_label_get_text(remoteAddressLabel), address.c_str()))
+                    lv_label_set_text(remoteAddressLabel, address.c_str());
+            }
             updateBatteryIndicator();
             time_t t=time(nullptr);
             struct tm local;
@@ -1746,6 +1900,7 @@ void setup() {
     if (xTaskCreatePinnedToCore(audio_task, "audio", 20480, nullptr, 2, nullptr, 0) != pdPASS) fatal("audio task");
     LOG("BOOT", "creating GUI task");
     if (xTaskCreatePinnedToCore(gui_task, "gui", 12288, nullptr, 5, nullptr, 1) != pdPASS) fatal("gui task");
+    startWebRemote();
     LOG("BOOT", "setup done");
 }
 // Основная работа уже выполняется отдельными задачами. Здесь только освобождаю процессор задержкой, без дополнительного обслуживания Audio или LVGL.
