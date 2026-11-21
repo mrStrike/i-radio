@@ -17,8 +17,15 @@ button:hover{outline:2px solid #ddd;outline-offset:-2px}button:active{filter:bri
 select{width:100%;background:#161616;color:#fff;border:1px solid #666;padding:12px;margin:0 0 12px;min-height:50px}
 input[type=range]{width:100%;accent-color:var(--blue);margin:16px 0;cursor:pointer;min-height:28px}
 .value{float:right;font-size:22px;font-weight:400}#favorites{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-bottom:14px}
-#favorites button{min-height:112px;font-size:23px;font-weight:300;padding:18px;background:#0078d7}
-#favorites button[data-slot="1"]{background:#17633b}#favorites button[data-slot="2"]{background:#c95110}#favorites button[data-slot="3"]{background:#555}
+#favorites button{min-height:112px;font-size:23px;font-weight:300;padding:18px;background:#a200ff}
+#favorites button[data-slot="1"]{background:#ff0097}
+#favorites button[data-slot="2"]{background:#00aba9}
+#favorites button[data-slot="3"]{background:#8cbf26}
+#favorites button[data-slot="4"]{background:#a05000}
+#favorites button[data-slot="5"]{background:#e671b8}
+#favorites button[data-slot="6"]{background:#1ba1e2}
+#favorites button[data-slot="7"]{background:#e51400}
+#favorites button[data-slot="8"]{background:#339933}
 #favorites:empty:before{content:"Пока нет избранных станций";color:#999;grid-column:1/-1;padding:16px 0}
 .minor button{font-size:15px;background:#202020}.settings{border-top:1px solid #333;padding-top:24px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}label{display:block;color:#ccc}label select{margin-top:10px}#remaining{color:#bbb;margin-bottom:0}#error{color:#ff8585}#error:empty{display:none}footer{border-top:1px solid #333;color:#888;font-size:14px;margin-top:28px;padding-top:16px}
 @media(max-width:520px){body{padding:20px 16px}h1{font-size:32px}#station{font-size:24px}.settings-grid{grid-template-columns:1fr}#favorites button{font-size:20px}.minor{flex-direction:column}}
@@ -27,7 +34,7 @@ input[type=range]{width:100%;accent-color:var(--blue);margin:16px 0;cursor:point
 <main><section aria-label="Текущая станция"><div class="now"><p id="station">Загрузка…</p><p id="status" aria-live="polite"></p><div class="actions minor" style="margin-top:14px"><button id="currentFavorite" disabled>Выберите станцию</button></div></div>
 <div class="actions"><button id="toggle" disabled>Пуск / Пауза</button><button id="stop">Остановить</button></div></section>
 <section class="section"><h2>Громкость <span class="value" id="volumeText"></span></h2><input aria-label="Громкость" id="volume" type="range" min="0" max="21"></section>
-<section class="section"><h2>Избранное <span id="favoriteCount" style="color:#aaa;font-size:18px">· 0 из 4</span></h2><div id="favorites"></div></section>
+<section class="section"><h2>Избранное <span id="favoriteCount" style="color:#aaa;font-size:18px">· 0 из 20</span></h2><div id="favorites"></div></section>
 <section class="section"><h2>Станции</h2><select aria-label="Выбор станции" id="stations"></select><div class="actions"><button id="play">Слушать выбранную</button></div>
 <p style="color:#aaa;margin:14px 0 8px">Выбранная станция</p><div class="actions minor"><button id="selectedFavorite" disabled>Выберите станцию</button></div></section>
 <section class="section settings"><h2>Настройки</h2><label>Яркость <span class="value" id="brightnessText"></span><input id="brightness" type="range" min="15" max="100"></label>
@@ -37,15 +44,15 @@ input[type=range]{width:100%;accent-color:var(--blue);margin:16px 0;cursor:point
 <script>
 const $=id=>document.getElementById(id);let busy=false,editing=false,loaded=false,brightEditing=false,remoteStateCache=null;
 // Для текущей и выбранной станции показываю только подходящее действие.
-// При заполненных четырёх местах оставляю удаление доступным.
+// При заполненных двадцати местах оставляю удаление доступным.
 function updateFavoriteButtons(){
 if(!remoteStateCache)return;
 const s=remoteStateCache,count=s.favorites.filter(id=>id>=0).length;
-$('favoriteCount').textContent='· '+count+' из 4';
+$('favoriteCount').textContent='· '+count+' из 20';
 for(const [button,id] of [[$('currentFavorite'),s.station],[$('selectedFavorite'),Number($('stations').value)]]){
 const valid=Number.isInteger(id)&&s.stations.some(x=>x.id===id),exists=valid&&s.favorites.includes(id);
-button.textContent=!valid?'Выберите станцию':exists?'− Удалить из избранного':count>=4?'Избранное заполнено — удалите одну станцию':'+ Добавить в избранное';
-button.disabled=!valid||(!exists&&count>=4);
+button.textContent=!valid?'Выберите станцию':exists?'− Удалить из избранного':count>=20?'Избранное заполнено — удалите одну станцию':'+ Добавить в избранное';
+button.disabled=!valid||(!exists&&count>=20);
 button.onclick=()=>command(exists?'favremove':'favadd',id);
 }
 }
@@ -54,7 +61,7 @@ async function refresh(){if(busy)return;busy=true;try{const r=await fetch('/api/
 updateFavoriteButtons();
 if(document.activeElement!==$('sleep'))$('sleep').value=s.sleep;
 $('remaining').textContent=s.remaining?'До остановки радио: '+Math.ceil(s.remaining/60)+' мин':'Таймер радио выключен';
-const signature=JSON.stringify(s.favorites);if($('favorites').dataset.signature!==signature){$('favorites').dataset.signature=signature;$('favorites').replaceChildren();for(const [slot,id] of s.favorites.entries()){if(id<0)continue;const button=document.createElement('button');button.dataset.slot=slot;button.textContent=s.stations[id].name;button.onclick=()=>command('play',id);$('favorites').append(button)}}
+const signature=JSON.stringify(s.favorites);if($('favorites').dataset.signature!==signature){$('favorites').dataset.signature=signature;$('favorites').replaceChildren();let colorIndex=0;for(const [slot,id] of s.favorites.entries()){if(id<0)continue;const button=document.createElement('button');button.dataset.slot=colorIndex++%9;button.textContent=s.stations[id].name;button.onclick=()=>command('play',id);$('favorites').append(button)}}
 }catch(e){$('error').textContent='Нет связи с радио: '+e.message}finally{busy=false}}
 $('toggle').onclick=()=>command('toggle');$('stop').onclick=()=>command('stop');$('play').onclick=()=>command('play',$('stations').value);
 $('volume').oninput=()=>{editing=true;$('volumeText').textContent=Math.round($('volume').value*100/21)+'%'};
@@ -87,7 +94,7 @@ static esp_err_t remoteState(httpd_req_t* req) {
     portEXIT_CRITICAL(&webStatusMux);
     int id = currentStation;
     if (id >= 100) id -= 100;
-    else if (id >= 0 && id < 4) id = favoriteIds[id].load();
+    else if (id >= 0 && id < FAVORITES_COUNT) id = favoriteIds[id].load();
     if (id < 0 || id >= ALL_STATIONS_COUNT) id = -1;
     String body; body.reserve(8192);
     body = "{\"station\":" + String(id) + ",\"name\":";
@@ -100,7 +107,7 @@ static esp_err_t remoteState(httpd_req_t* req) {
         body += "{\"id\":" + String(i) + ",\"name\":" + remoteJson(ALL_STATIONS[i].name) + '}';
     }
     body += "],\"favorites\":[";
-    for(int i=0;i<4;i++){if(i)body+=',';body+=String(favoriteIds[i].load());}
+    for(int i=0;i<FAVORITES_COUNT;i++){if(i)body+=',';body+=String(favoriteIds[i].load());}
     uint32_t deadline=radioDeadline.load();
     int32_t left=deadline ? int32_t(deadline-millis()) : 0;
     body += "],\"brightness\":" + String(currentBrightness.load());
@@ -140,10 +147,10 @@ static esp_err_t remoteControl(httpd_req_t* req) {
             return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid value");
         if(kind==3) {
             bool exists=false, empty=false;
-            for(int i=0;i<4;i++){int id=favoriteIds[i].load();exists|=id==n;empty|=id<0;}
+            for(int i=0;i<FAVORITES_COUNT;i++){int id=favoriteIds[i].load();exists|=id==n;empty|=id<0;}
             if(!exists && !empty) {
                 httpd_resp_set_status(req,"409 Conflict");
-                return httpd_resp_send(req,"В избранном уже четыре станции",HTTPD_RESP_USE_STRLEN);
+                return httpd_resp_send(req,"В избранном уже 20 станций",HTTPD_RESP_USE_STRLEN);
             }
         }
         RemoteSetting setting{kind,int(n)};
