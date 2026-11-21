@@ -25,7 +25,6 @@ static void localWifiKeyboardEvent(lv_event_t* e) {
     if (lv_event_get_code(e) != LV_EVENT_VALUE_CHANGED) return;
     lv_obj_t* keyboard = (lv_obj_t*)lv_event_get_current_target(e);
     if (keyboard != localWifiKeyboard || lv_event_get_target(e) != keyboard) return;
-    Serial.println("[WiFi keyboard] event entered");
     uint32_t id = lv_keyboard_get_selected_button(keyboard);
     if (id == LV_BUTTONMATRIX_BUTTON_NONE) return;
     const char* text = lv_keyboard_get_button_text(keyboard, id);
@@ -34,7 +33,6 @@ static void localWifiKeyboardEvent(lv_event_t* e) {
     if (n >= sizeof(localWifiPendingKey)) return;
     memcpy(localWifiPendingKey, text, n + 1);
     localWifiKeyPending = true;
-    Serial.println("[WiFi keyboard] command queued");
 }
 static void localWifiProcessKey() {
     if (!localWifiKeyPending) return;
@@ -45,7 +43,6 @@ static void localWifiProcessKey() {
     const char* text = key;
     lv_obj_t* keyboard = localWifiKeyboard;
     if (lv_obj_has_flag(localWifiEditor, LV_OBJ_FLAG_HIDDEN)) return;
-    Serial.println("[WiFi keyboard] processing command");
     // This keyboard has only our input callback; handle layouts explicitly.
     if (!strcmp(text, "abc")) {
         lv_keyboard_set_mode(keyboard, LV_KEYBOARD_MODE_TEXT_LOWER);
@@ -75,9 +72,7 @@ static void localWifiProcessKey() {
         localWifiPasswordLength += n;
         localWifiPasswordBuffer[localWifiPasswordLength] = '\0';
     }
-    Serial.println("[WiFi keyboard] updating password display");
     lv_label_set_text(localWifiPassword, localWifiPasswordBuffer);
-    Serial.println("[WiFi keyboard] password display updated");
 }
 static void localWifiWorker(void*) {
     int result;

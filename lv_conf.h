@@ -4,6 +4,7 @@
 // LV_TICK_CUSTOM = 0: время передаю вручную через lv_tick_inc в GUI.
 #ifndef LV_CONF_H
 #define LV_CONF_H
+#define LV_USE_LOG 0
 #define LV_COLOR_DEPTH 16
 /* Все экраны и строки списка с отдельными чекбоксами: запас в PSRAM. */
 #define LV_MEM_SIZE (512U * 1024U)

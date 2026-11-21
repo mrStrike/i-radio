@@ -21,6 +21,9 @@
 #include <freertos/semphr.h>
 #include <esp_log.h>
 #include <LittleFS.h>
+#include <SD_MMC.h>
+#include <vector>
+#include <algorithm>
 #include <math.h>
 #include <atomic>
 #include <time.h>
@@ -71,7 +74,7 @@ struct WireGuard {
 #define LOG(...) ((void)0)
 #define LOGE(...) ((void)0)
 // Temporary stream diagnostics. Disable this switch after investigation.
-static constexpr bool STREAM_COM_DIAGNOSTICS = true;
+static constexpr bool STREAM_COM_DIAGNOSTICS = false;
 static std::atomic<bool> streamDiagTarget{false};
 static QueueHandle_t streamLogQueue = nullptr;
 static std::atomic<uint32_t> streamLogDropped{0};
@@ -87,6 +90,8 @@ static void streamLog(const char* tag, const char* fmt, ...) {
     va_end(args);
     if (xQueueSend(streamLogQueue, &line, 0) != pdTRUE) ++streamLogDropped;
 }
+// No diagnostic formatting or argument evaluation in playback paths.
+#define streamLog(...) ((void)0)
 // Wrap the existing TLS receive callback, without reading extra bytes or
 // changing return values. Capture errno before logging/cleanup can overwrite it.
 #ifndef MBEDTLS_PRIVATE
@@ -189,7 +194,7 @@ static void streamComTask(void*) {
     StreamLogLine line;
     for (;;) {
         if (xQueueReceive(streamLogQueue, &line, portMAX_DELAY) == pdTRUE)
-            Serial.println(line.text);
+            (void)line; // No serial output.
     }
 }
 // При невосстановимой ошибке отключаю усилитель и останавливаю выполнение. Не продолжаю запуск с отсутствующей памятью или неготовым оборудованием.
@@ -397,6 +402,11 @@ static lv_obj_t* remoteAddressLabel = nullptr;
 static lv_obj_t* wifiScreen = nullptr;
 static lv_obj_t* volumeSlider = nullptr;
 static lv_obj_t* volumeLabel = nullptr;
+static lv_obj_t *volumeOverlay = nullptr, *popupVolumeSlider = nullptr, *popupVolumeLabel = nullptr;
+static bool sdFolderPopupOpen=false;
+static bool volumePopupOpen = false;
+static uint32_t volumePopupActivity = 0;
+
 static lv_obj_t* statusLabel = nullptr;
 static lv_obj_t* brightnessLabel = nullptr;
 static lv_obj_t* wifiIndicator = nullptr;
@@ -414,9 +424,6 @@ static char currentStatus[96] = "Нажмите плитку";
 // Копию статуса для веб-пульта защищаю отдельно: HTTP не обращается к LVGL.
 static portMUX_TYPE webStatusMux = portMUX_INITIALIZER_UNLOCKED;
 static char webStatus[96] = "Нажмите плитку";
-static lv_obj_t* playingScreen = nullptr;
-static lv_obj_t* playingTitle = nullptr;
-static lv_obj_t* playingBody = nullptr;
 static int pendingPlayingSwipe = 0;
 static bool pendingLocalWifiSwipe = false;
 static volatile int currentStation = -1;
@@ -689,25 +696,25 @@ static void touchRead(lv_indev_t*, lv_indev_data_t* data) {
         return;
     }
     // Classify horizontal motion before release so a swipe cannot click a tile.
-    static bool tracking = false, horizontal = false;
+    static bool tracking = false, horizontal = false, blockNavigation = false;
     static int startX = 0, startY = 0;
     static lv_obj_t* startScreen = nullptr;
     if (p && !tracking) {
         tracking = true; horizontal = false;
+        blockNavigation = sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
         startX = x; startY = y; startScreen = lv_screen_active();
     }
-    if (p && tracking && (startScreen == mainScreen || startScreen == playingScreen || startScreen == settingsScreen || startScreen == debugScreen)) {
+    if (p && volumePopupOpen) volumePopupActivity = millis();
+    if (p && tracking && !blockNavigation && !volumePopupOpen && (startScreen == mainScreen || startScreen == settingsScreen || startScreen == debugScreen)) {
         int dx = x - startX, dy = y - startY;
         if (!horizontal && abs(dx) >= 45 && abs(dx) > abs(dy) * 2) {
             horizontal = true;
             lv_indev_wait_release(lv_indev_active());
             if (startScreen == mainScreen && dx < 0) pendingPlayingSwipe = 1;
             if (startScreen == mainScreen && dx > 0) pendingLocalWifiSwipe = true;
-            if (startScreen == playingScreen && dx > 0) pendingPlayingSwipe = -1;
-            if (startScreen == playingScreen && dx < 0) pendingScreenSwipe = settingsScreen;
-            if (startScreen == settingsScreen && dx < 0) pendingScreenSwipe = debugScreen;
-            if (startScreen == settingsScreen && dx > 0) pendingScreenSwipe = mainScreen;
-            if (startScreen == debugScreen && dx > 0) pendingScreenSwipe = settingsScreen;
+            if (startScreen == debugScreen && dx > 0) pendingPlayingSwipe = -1;
+            if (startScreen == debugScreen && dx < 0) pendingScreenSwipe = settingsScreen;
+            if (startScreen == settingsScreen && dx > 0) pendingScreenSwipe = debugScreen;
         }
     }
     if (!p) { tracking = false; horizontal = false; }
@@ -865,6 +872,79 @@ static void volumeEvent(lv_event_t* e) {
         lv_label_set_text(volumeLabel, b);
     }
 }
+// One shared overlay; only the GUI task touches these objects.
+static void closeVolumePopup(lv_event_t*) {
+    volumePopupOpen = false;
+    lv_obj_add_flag(volumeOverlay, LV_OBJ_FLAG_HIDDEN);
+}
+static void openVolumePopup(lv_event_t*) {
+    if (volumePopupOpen) { closeVolumePopup(nullptr); return; }
+    volumePopupOpen = true;
+    volumePopupActivity = millis();
+    lv_slider_set_value(popupVolumeSlider, currentVolume.load(), LV_ANIM_OFF);
+    char text[16]; snprintf(text, sizeof(text), "%d%%", currentVolume.load()*100/21);
+    lv_label_set_text(popupVolumeLabel, text);
+    lv_obj_remove_flag(volumeOverlay, LV_OBJ_FLAG_HIDDEN);
+}
+static void popupVolumeEvent(lv_event_t* e) {
+    volumePopupActivity = millis();
+    if (lv_event_get_code(e) == LV_EVENT_VALUE_CHANGED) {
+        volumeEvent(e);
+        char text[16]; snprintf(text, sizeof(text), "%d%%", currentVolume.load()*100/21);
+        lv_label_set_text(popupVolumeLabel, text);
+    }
+}
+static void buildVolumePopup() {
+    lv_obj_t* top = lv_layer_top();
+    volumeOverlay = mustCreate(top, "volumeOverlay");
+    lv_obj_remove_style_all(volumeOverlay);
+    lv_obj_set_size(volumeOverlay, 240, 320);
+    lv_obj_add_flag(volumeOverlay, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(volumeOverlay, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(volumeOverlay, closeVolumePopup, LV_EVENT_CLICKED, nullptr);
+    lv_obj_t* panel = mustCreate(volumeOverlay, "volumePanel");
+    lv_obj_remove_style_all(panel);
+    lv_obj_set_pos(panel, 8, 40); lv_obj_set_size(panel, 224, 88);
+    lv_obj_set_style_bg_color(panel, lv_color_hex(0x18221b), 0);
+    lv_obj_set_style_bg_opa(panel, LV_OPA_COVER, 0);
+    lv_obj_set_style_border_color(panel, lv_color_hex(0x508050), 0);
+    lv_obj_set_style_border_width(panel, 1, 0);
+    lv_obj_add_flag(panel, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_remove_flag(panel, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE | LV_OBJ_FLAG_EVENT_BUBBLE | LV_OBJ_FLAG_GESTURE_BUBBLE));
+    lv_obj_t* caption = mustLabel(panel, "volumeCaption");
+    lv_obj_set_style_text_font(panel, &dejavu_16, 0);
+    lv_obj_set_style_text_color(panel, lv_color_hex(0x80ff80), 0);
+    lv_label_set_text(caption, "Громкость"); lv_obj_set_pos(caption, 12, 10);
+    popupVolumeLabel = mustLabel(panel, "popupVolumePercent");
+    lv_obj_set_pos(popupVolumeLabel, 170, 10);
+    popupVolumeSlider = lv_slider_create(panel);
+    lv_obj_set_pos(popupVolumeSlider, 20, 53); lv_obj_set_size(popupVolumeSlider, 184, 16);
+    lv_obj_set_ext_click_area(popupVolumeSlider, 12);
+    lv_slider_set_range(popupVolumeSlider, 0, 21);
+    lv_obj_set_style_bg_color(popupVolumeSlider, lv_color_hex(0x39463c), LV_PART_MAIN);
+    lv_obj_set_style_bg_color(popupVolumeSlider, lv_color_hex(0x80ff80), LV_PART_INDICATOR);
+    lv_obj_set_style_bg_color(popupVolumeSlider, lv_color_hex(0xffffff), LV_PART_KNOB);
+    lv_obj_remove_flag(popupVolumeSlider, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_EVENT_BUBBLE));
+    lv_obj_add_event_cb(popupVolumeSlider, popupVolumeEvent, LV_EVENT_ALL, nullptr);
+    lv_obj_add_flag(volumeOverlay, LV_OBJ_FLAG_HIDDEN);
+    // Opaque square pixels, no glyphs or antialiasing.
+    lv_obj_t* button = mustButton(top, "globalVolume");
+    lv_obj_set_pos(button, 204, 2); lv_obj_set_size(button, 34, 34);
+    lv_obj_set_style_pad_all(button, 0, 0);
+    lv_obj_set_style_bg_color(button, lv_color_hex(0x18221b), 0);
+    lv_obj_remove_flag(button, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(button, openVolumePopup, LV_EVENT_CLICKED, nullptr);
+    const int pixels[][4] = {{6,13,4,8},{10,11,2,12},{12,9,2,16},{14,7,2,20},{20,11,2,12},{24,8,2,18}};
+    for (const auto& r : pixels) {
+        lv_obj_t* pixel = mustCreate(button, "speakerPixel");
+        lv_obj_remove_style_all(pixel);
+        lv_obj_set_pos(pixel,r[0],r[1]); lv_obj_set_size(pixel,r[2],r[3]);
+        lv_obj_set_style_bg_color(pixel,lv_color_hex(0x80ff80),0);
+        lv_obj_set_style_bg_opa(pixel,LV_OPA_COVER,0);
+        lv_obj_remove_flag(pixel,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE));
+    }
+}
+
 // Открываю уже созданный список станций без повторного выделения объектов.
 static void openListEvent(lv_event_t*) {
     if (listScreen) lv_screen_load(listScreen);
@@ -1166,6 +1246,25 @@ static void buildMainScreen() {
 }
 /* ---------- Список станций ---------- */
 // Создаю прокручиваемый список. В каждой строке чекбокс и кнопка воспроизведения являются соседними объектами, чтобы управление избранным не запускало станцию.
+// Opaque pixel navigation arrows. Decorative children never intercept taps.
+static void navigationArrow(lv_obj_t* button, bool right, uint32_t color) {
+    lv_obj_set_style_pad_all(button,0,0);
+    lv_obj_remove_flag(button,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_SCROLL_CHAIN_HOR|LV_OBJ_FLAG_SCROLL_CHAIN_VER));
+    lv_obj_update_layout(button);
+    int cx=lv_obj_get_width(button)/2, cy=lv_obj_get_height(button)/2;
+    auto pixel=[&](int x,int y,int w,int h) {
+        lv_obj_t* p=lv_obj_create(button); lv_obj_remove_style_all(p);
+        lv_obj_set_pos(p,x,y); lv_obj_set_size(p,w,h);
+        lv_obj_set_style_bg_color(p,lv_color_hex(color),0);
+        lv_obj_set_style_bg_opa(p,LV_OPA_COVER,0);
+        lv_obj_remove_flag(p,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE));
+    };
+    pixel(cx-8,cy-2,16,4);
+    for(int i=0;i<5;++i) {
+        int x=right ? cx+6-i*2 : cx-8+i*2;
+        pixel(x,cy-2-i*2,2,4); pixel(x,cy-2+i*2,2,4);
+    }
+}
 static void buildListScreen() {
     listScreen = lv_obj_create(NULL);
     if (!listScreen) fatal("listScreen alloc failed");
@@ -1182,10 +1281,7 @@ static void buildListScreen() {
     lv_obj_align(backBtn, LV_ALIGN_TOP_LEFT, 8, 4);
     lv_obj_set_style_bg_color(backBtn, lv_color_hex(0x2a2a3a), 0);
     lv_obj_add_event_cb(backBtn, backEvent, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* backLbl = mustLabel(backBtn, "backLbl");
-    lv_label_set_text(backLbl, "<");
-    lv_obj_center(backLbl);
-    lv_obj_set_style_text_color(backLbl, lv_color_hex(0xffffff), 0);
+    navigationArrow(backBtn,false,0xffffff);
     lv_obj_t* list = mustCreate(listScreen, "listContainer");
     lv_obj_set_pos(list, 8, 40);
     lv_obj_set_size(list, 224, 272);
@@ -1261,50 +1357,8 @@ static void showAuthorEvent(lv_event_t* e) {
 static void hideAuthorEvent(lv_event_t* e) {
     lv_obj_add_flag(static_cast<lv_obj_t*>(lv_event_get_user_data(e)), LV_OBJ_FLAG_HIDDEN);
 }
-// Static diagnostic chart: labels describe expected RGB colors, not observed ones.
-static void debugBackEvent(lv_event_t*) {
-    lv_screen_load(settingsScreen);
-}
-static void buildDebugScreen() {
-    debugScreen = mustCreate(nullptr, "debugScreen");
-    lv_obj_remove_style_all(debugScreen);
-    lv_obj_set_style_bg_opa(debugScreen, LV_OPA_COVER, 0);
-    lv_obj_set_style_bg_color(debugScreen, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_text_font(debugScreen, &dejavu_16, 0);
-    lv_obj_remove_flag(debugScreen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* back = mustButton(debugScreen, "debugBack");
-    lv_obj_set_pos(back, 4, 4);
-    lv_obj_set_size(back, 40, 32);
-    lv_obj_add_event_cb(back, debugBackEvent, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* arrow = mustLabel(back, "debugArrow");
-    lv_label_set_text(arrow, "<");
-    lv_obj_center(arrow);
-    lv_obj_t* title = mustLabel(debugScreen, "debugTitle");
-    lv_label_set_text(title, "Отладка цветов");
-    lv_obj_set_pos(title, 50, 10);
-    lv_obj_set_style_text_color(title, lv_color_hex(0xFFFFFF), 0);
-    const uint32_t colors[] = {0xFF0000, 0xFF8000, 0xFFFF00, 0x00FF00,
-                               0x00FFFF, 0x0000FF, 0x8000FF, 0xFFFFFF, 0xE0E0E0};
-    const char* names[] = {"Красный", "Оранжевый", "Жёлтый", "Зелёный",
-                           "Голубой", "Синий", "Фиолетовый", "Белый", "Светло-серый"};
-    for (int i = 0; i < 9; ++i) {
-        lv_obj_t* patch = mustCreate(debugScreen, "colorPatch");
-        lv_obj_remove_style_all(patch);
-        lv_obj_remove_flag(patch, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_set_pos(patch, 8, 44 + i * 27);
-        lv_obj_set_size(patch, 44, 23);
-        lv_obj_set_style_bg_opa(patch, LV_OPA_COVER, 0);
-        lv_obj_set_style_bg_color(patch, lv_color_hex(colors[i]), 0);
-        lv_obj_t* label = mustLabel(debugScreen, "colorName");
-        lv_label_set_text(label, names[i]);
-        lv_obj_set_pos(label, 60, 46 + i * 27);
-        lv_obj_set_style_text_color(label, lv_color_hex(0xFFFFFF), 0);
-    }
-    lv_obj_t* hint = mustLabel(debugScreen, "debugHint");
-    lv_label_set_text(hint, "Ожидаемые цвета RGB");
-    lv_obj_set_pos(hint, 8, 294);
-    lv_obj_set_style_text_color(hint, lv_color_hex(0xFFFFFF), 0);
-}
+// First SD-player milestone: read-only discovery; audio ownership unchanged.
+#include "sd_player_ui.h"
 
 /* ---------- Настройки ---------- */
 // Создаю громкость, яркость, сон дисплея, таймер радио, настройку сети и окно автора. Ползунки связаны с отдельными обработчиками; построение экрана не запускает их действия вручную.
@@ -1324,10 +1378,7 @@ static void buildSettingsScreen() {
     lv_obj_align(backBtn, LV_ALIGN_TOP_LEFT, 8, 4);
     lv_obj_set_style_bg_color(backBtn, lv_color_hex(0x2a2a3a), 0);
     lv_obj_add_event_cb(backBtn, backFromSettingsEvent, LV_EVENT_CLICKED, nullptr);
-    lv_obj_t* backLbl = mustLabel(backBtn, "setBackLbl");
-    lv_label_set_text(backLbl, "<");
-    lv_obj_center(backLbl);
-    lv_obj_set_style_text_color(backLbl, lv_color_hex(0xffffff), 0);
+    navigationArrow(backBtn,false,0xffffff);
     lv_obj_t* volTitle = mustLabel(settingsScreen, "volTitle");
     lv_label_set_text(volTitle, "Громкость");
     lv_obj_set_style_text_color(volTitle, lv_color_hex(0x9090a0), 0);
@@ -1497,67 +1548,6 @@ static void buildSettingsScreen() {
     // Keep the overlay above the info button too.
     lv_obj_move_foreground(authorPanel);
 }
-// Information screen: same font, flat Metro layout, independently scrollable text.
-static void buildPlayingScreen() {
-    playingScreen = mustCreate(nullptr, "playingScreen");
-    lv_obj_set_style_bg_color(playingScreen, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_text_font(playingScreen, &dejavu_16, 0);
-    lv_obj_set_style_text_color(playingScreen, lv_color_hex(0xffffff), 0);
-    lv_obj_set_style_pad_all(playingScreen, 0, 0);
-    lv_obj_set_style_border_width(playingScreen, 0, 0);
-    lv_obj_remove_flag(playingScreen, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_t* back = mustButton(playingScreen, "playingBack");
-    lv_obj_set_pos(back, 8, 6); lv_obj_set_size(back, 224, 30);
-    lv_obj_set_style_bg_color(back, lv_color_hex(0x1BA1E2), 0);
-    lv_obj_t* caption = mustLabel(back, "playingBackText");
-    lv_obj_set_style_text_color(caption, lv_color_hex(0xffffff), 0);
-    lv_label_set_text(caption, "Назад к радио"); lv_obj_center(caption);
-    lv_obj_add_event_cb(back, backEvent, LV_EVENT_SHORT_CLICKED, nullptr);
-    playingTitle = mustLabel(playingScreen, "playingTitle");
-    lv_obj_set_pos(playingTitle, 10, 44); lv_obj_set_size(playingTitle, 220, 48);
-    lv_obj_set_style_text_color(playingTitle, lv_color_hex(0x00ABA9), 0);
-    lv_obj_t* panel = mustCreate(playingScreen, "playingScroll");
-    lv_obj_set_pos(panel, 8, 96); lv_obj_set_size(panel, 224, 216);
-    lv_obj_set_style_bg_opa(panel, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(panel, 0, 0);
-    lv_obj_set_style_pad_all(panel, 2, 0);
-    lv_obj_set_scroll_dir(panel, LV_DIR_VER);
-    playingBody = mustLabel(panel, "playingBody");
-    lv_obj_set_style_text_color(playingBody, lv_color_hex(0xe0e0e0), 0);
-    lv_obj_set_width(playingBody, 208);
-    lv_label_set_long_mode(playingBody, LV_LABEL_LONG_MODE_WRAP);
-    lv_label_set_text(playingBody, "");
-}
-static void refreshPlayingScreen() {
-    if (displaySleeping || lv_screen_active() != playingScreen) return;
-    static uint32_t previous = 0;
-    if (millis() - previous < 500) return;
-    previous = millis();
-    char track[256], broadcast[128], description[256], website[192];
-    portENTER_CRITICAL(&nowDataMux);
-    strlcpy(track, nowTrack, sizeof(track)); strlcpy(broadcast, nowBroadcast, sizeof(broadcast));
-    strlcpy(description, nowDescription, sizeof(description)); strlcpy(website, nowWebsite, sizeof(website));
-    portEXIT_CRITICAL(&nowDataMux);
-    const auto* station = selectedStation(currentStation);
-    const char* title = station ? station->name : "Станция не выбрана";
-    if (strcmp(lv_label_get_text(playingTitle), title)) setTileText(playingTitle, title, 220);
-    String text = "Композиция / исполнитель:\n";
-    text += track[0] ? track : "Станция не передаёт сведения о треке";
-    text += "\n\nСостояние: "; text += currentStatus;
-    if (broadcast[0]) { text += "\n\nНазвание в эфире:\n"; text += broadcast; }
-    if (description[0]) { text += "\n\nОписание:\n"; text += description; }
-    if (website[0]) { text += "\n\nСайт:\n"; text += website; }
-    text += "\n\nЗвук:\n";
-    uint32_t rate = nowRate.load(), bitrate = nowBitrate.load();
-    uint8_t channels = nowChannels.load();
-    text += bitrate ? String(bitrate / 1000) + " кбит/с" : "Битрейт: нет данных";
-    text += "\n"; text += rate ? String(rate) + " Гц" : "Частота: нет данных";
-    text += "\n"; text += channels == 1 ? "Моно" : channels == 2 ? "Стерео" : "Каналы: нет данных";
-    text += "\n\nWi-Fi: ";
-    text += WiFi.status() == WL_CONNECTED ? String(WiFi.RSSI()) + " дБм" : "нет подключения";
-    if (station) { text += "\n\nАдрес потока:\n"; text += station->url; }
-    if (strcmp(lv_label_get_text(playingBody), text.c_str())) lv_label_set_text(playingBody, text.c_str());
-}
 /* ---------- Экран Wi-Fi ---------- */
 // Создаю экран инструкции для портала: имя временной сети, адрес браузера и порядок сохранения домашней сети.
 static void buildWifiScreen() {
@@ -1625,6 +1615,8 @@ static void refreshUi() {
         snprintf(b, sizeof(b), "%d%%", currentVolume.load() * 100 / 21);
         lv_label_set_text(volumeLabel, b);
         lv_slider_set_value(volumeSlider, currentVolume.load(), LV_ANIM_OFF);
+        if (popupVolumeLabel) lv_label_set_text(popupVolumeLabel, b);
+        if (popupVolumeSlider) lv_slider_set_value(popupVolumeSlider, currentVolume.load(), LV_ANIM_OFF);
     }
     const char* toneText = testToneActive ? "Тестовый тон: ВКЛ" : "Тестовый тон: ВЫКЛ";
     if (toneLabel && strcmp(lv_label_get_text(toneLabel), toneText))
@@ -1799,7 +1791,47 @@ void audio_task(void*) {
         (unsigned long)toneStarts, unsigned(fileSize), int(accepted), (unsigned long)(millis()-started));
         return accepted;
     };
-    bool restorePending = savedStation >= 0;
+    // Mount/scan the card before deciding between MP3 and radio restore.
+    String sdBookmark;
+    bool sdRestorePending=true;
+    sdWebScanRequested.store(true);
+    bool restorePending = false;
+    auto clearSdPosition = [&]() {
+        SD_MMC.remove("/.saved-state");
+        SD_MMC.remove("/.saved-state.bak");
+        SD_MMC.remove("/.saved-state.tmp");
+    };
+    uint32_t sdCheckpointAt=millis();
+    auto saveSdPosition = [&]() {
+        int index=sdCurrent.load();
+        if(!sdActive.load() || index<0 || index>=int(sdMp3Files.size())) return;
+#if AUDIO_PROBE_V4
+        // 4.x connecttoFS expects seconds, not a byte offset.
+        String position=String("s")+String(audio.getAudioCurrentTime());
+#else
+        uint32_t pos=audio.getFilePos();
+        uint32_t buffered=audio.inBufferFilled();
+        pos=pos>buffered ? pos-buffered : 0;
+        String position=String(pos);
+#endif
+        File file=SD_MMC.open(sdMp3Files[index],FILE_READ);
+        uint32_t size=file ? file.size() : 0; if(file) file.close();
+        String record=position+"\n"+String(size)+"\n"+String(sdPaused.load()?1:0)+"\n"+sdMp3Files[index];
+        // Write a complete temporary record before rotating the previous one.
+        SD_MMC.remove("/.saved-state.tmp");
+        File state=SD_MMC.open("/.saved-state.tmp",FILE_WRITE);
+        if(state) {
+            bool ok=state.print(record)==record.length();
+            state.flush(); state.close();
+            if(ok) {
+                SD_MMC.remove("/.saved-state.bak");
+                bool rotated=!SD_MMC.exists("/.saved-state") ||
+                    SD_MMC.rename("/.saved-state","/.saved-state.bak");
+                if(rotated) SD_MMC.rename("/.saved-state.tmp","/.saved-state");
+            }
+        }
+        sdCheckpointAt=millis();
+    };
     int persistedVolume = currentVolume;
     int observedVolume = currentVolume;
     uint32_t volumeChangedAt = millis();
@@ -1866,7 +1898,7 @@ void audio_task(void*) {
         }
         // Проверяю таймер радио с разностью знаковых миллисекунд. По окончании отменяю намерение воспроизведения и автоматическое восстановление.
         uint32_t deadline=radioDeadline.load();
-        if(deadline && int32_t(millis()-deadline)>=0) {
+        if(!sdActive.load() && deadline && int32_t(millis()-deadline)>=0) {
             radioDeadline=0;
             wantPlayback=false;
             restorePending=false;
@@ -1906,12 +1938,90 @@ void audio_task(void*) {
                 savedStation >= 100 ? CMD_PLAY_ALL : CommandType(CMD_PLAY_FAV_0 + savedStation), uint8_t(savedStation >= 100 ? savedStation-100 : 0)
             });
         }
+        auto startSd = [&](int index, int32_t resumePos=-1) {
+            wantPlayback=false; restorePending=false; testToneActive=false;
+            recoveryAllowed=false; stoppedByTimer=true; streamOpenedAt=0;
+            audio.stopSong(); isPlaying=false; wasRunning=false;
+            lastDecodedAudioAt.store(0); sdEnded=false; sdPaused=false;
+            sdElapsed=0; sdDuration=0;
+            if(index>=0 && index<int(sdMp3Files.size())) {
+                sdCurrent=index;
+                sdActive=audio.connecttoFS(SD_MMC,sdMp3Files[index].c_str(),resumePos);
+                applyStreamVolume();
+                pushStatus(sdActive.load()?"MP3: воспроизведение":"Не удалось открыть MP3");
+            } else sdActive=false;
+        };
+        if(sdRestorePending && (sdScanState.load()==2 || sdScanState.load()==3)) {
+            sdRestorePending=false;
+            if(sdScanState.load()==2) {
+                File state=SD_MMC.open("/.saved-state",FILE_READ);
+                if(!state) state=SD_MMC.open("/.saved-state.bak",FILE_READ);
+                if(state) {
+                    if(state.size()<=4096) sdBookmark=state.readString();
+                    state.close();
+                }
+            }
+            restorePending=sdBookmark.isEmpty() && savedStation>=0;
+            int a=sdBookmark.indexOf('\n'), b=sdBookmark.indexOf('\n',a+1), d=sdBookmark.indexOf('\n',b+1);
+            if(a>0 && b>a && d>b) {
+                String path=sdBookmark.substring(d+1);
+                auto it=std::find(sdMp3Files.begin(),sdMp3Files.end(),path);
+                if(it!=sdMp3Files.end()) {
+                    File f=SD_MMC.open(path,FILE_READ);
+                    uint32_t size=f ? f.size() : 0; if(f) f.close();
+                    String position=sdBookmark.substring(0,a);
+                    bool seconds=position.startsWith("s");
+                    uint32_t pos=strtoul(position.c_str()+(seconds?1:0),nullptr,10);
+#if AUDIO_PROBE_V4
+                    bool compatible=seconds && pos<=INT32_MAX;
+#else
+                    bool compatible=!seconds && pos<size && pos<=INT32_MAX;
+#endif
+                    if(size && size==strtoul(sdBookmark.substring(a+1,b).c_str(),nullptr,10) && compatible) {
+                        int index=int(it-sdMp3Files.begin());
+                        startSd(index,int32_t(pos));
+                        if(sdActive.load()) {
+                            if(sdActive.load() && sdBookmark.substring(b+1,d)=="1") {audio.pauseResume(); sdPaused=true;}
+                        }
+                    }
+                }
+            }
+        }
+        int sdCmd=sdAction.exchange(0);
+        if(sdCmd) sdRestorePending=false;
+        if(sdCmd==1 && sdScanState.load()==2 && !sdMp3Files.empty()) {
+            if(sdActive.load() && sdPaused.load() && sdCurrent.load()==sdRequested.load()) {
+                audio.pauseResume(); sdPaused=false; saveSdPosition();
+            } else {startSd(sdRequested.load()); saveSdPosition();}
+        } else if(sdCmd==2 && sdActive.load()) {
+            audio.pauseResume(); sdPaused=!sdPaused.load(); saveSdPosition();
+        } else if(sdCmd==6) {
+            clearSdPosition();
+            if(sdActive.load()) audio.stopSong();
+            sdActive=false; sdPaused=false; sdEnded=false;
+            sdCurrent=-1; sdElapsed=0; sdDuration=0; sdSeekSeconds=-1;
+            sdEditStopped.store(true);
+        } else if(sdCmd==3 && sdActive.load()) {
+            clearSdPosition();
+            audio.stopSong(); sdActive=false; sdPaused=false; sdElapsed=0;
+        }
+        int seekSeconds=sdSeekSeconds.exchange(-1);
+        if(seekSeconds>=0 && sdActive.load() && sdSeekTrack.load()==sdCurrent.load()) {
+            // Both audio library versions support relative seeking in seconds.
+            const int currentSeconds = int(audio.getAudioCurrentTime());
+            audio.setTimeOffset(seekSeconds - currentSeconds);
+        }
         Command c;
         if (xQueueReceive(audioCmdQueue, &c, 0) == pdTRUE) {
             // Пока сервер отвечал, могло накопиться несколько нажатий.
             // Выполняю последнее пожелание, а не подключаю все станции по очереди.
             Command newer;
             while (xQueueReceive(audioCmdQueue, &newer, 0) == pdTRUE) c = newer;
+            if(c.type!=CMD_SET_VOLUME) {sdRestorePending=false; clearSdPosition();}
+            if(sdActive.load() && c.type!=CMD_SET_VOLUME) {
+                audio.stopSong(); sdActive=false; sdPaused=false; sdEnded=false;
+                stoppedByTimer=true;
+            }
             LOG("AUDIO CMD", "received type=%d value=%u queued=%u", int(c.type), c.value, unsigned(uxQueueMessagesWaiting(audioCmdQueue)));
             if (c.type == CMD_SET_VOLUME) {
                 /* Legacy command: the atomic mailbox is authoritative. */
@@ -2096,6 +2206,20 @@ void audio_task(void*) {
             }
             diagLoops = diagMaxLoopUs = diagMaxGapUs = 0;
         }
+        if(sdActive.load()) {
+            sdElapsed=audio.getAudioCurrentTime(); sdDuration=audio.getAudioFileDuration();
+            if(!sdPaused.load() && millis()-sdCheckpointAt>=30000) saveSdPosition();
+            // EOF callback differs between audio library versions. Also handle
+            // a completed local playback directly, in the Audio-owning task.
+            // Stop clears sdActive above; Pause must never advance the playlist.
+            const bool ended = sdEnded.exchange(false);
+            if(!sdPaused.load() && (ended || !audio.isRunning())) {
+                int next=sdCurrent.load()+1;
+                if(next<int(sdMp3Files.size())) {startSd(next); saveSdPosition();}
+                else {sdActive=false; sdPaused=false; audio.stopSong(); clearSdPosition();}
+            }
+            vTaskDelay(1); continue;
+        }
         nowRate.store(audio.getSampleRate());
         nowBitrate.store(audio.getBitRate());
         nowChannels.store(audio.getChannels());
@@ -2186,8 +2310,8 @@ void gui_task(void*) {
     buildDebugScreen();
     LOG("BOOT", "building Wifi screen");
     buildWifiScreen();
-    buildPlayingScreen();
     buildLocalWifiScreen();
+    buildVolumePopup();
     // Экраны уже готовы: после заставки сразу рисуем интерфейс.
     showStartupLogo();
     LOG("BOOT", "loading main screen");
@@ -2201,6 +2325,7 @@ void gui_task(void*) {
     uint32_t last = millis(), lastWifiCheck = 0, lastUiRefresh = 0;
     for (;;) {
         uint32_t now = millis();
+        updateSdPlayer();
         lv_tick_inc(now - last);
         last = now;
         if (portalReturnRequested) {
@@ -2249,7 +2374,6 @@ void gui_task(void*) {
             lastUiRefresh = now;
             refreshUi();
             refreshSpectrum();
-            refreshPlayingScreen();
         }
         if (now - lastWifiCheck > 1000) {
             lastWifiCheck = now;
@@ -2282,12 +2406,14 @@ void gui_task(void*) {
         // LVGL обслуживает касания и перерисовку; сон ниже выключает только подсветку, аудиозадача продолжает работать.
         refreshLocalWifi();
         lv_timer_handler();
+        if (volumePopupOpen && millis() - volumePopupActivity >= 3000)
+            closeVolumePopup(nullptr);
         if (pendingLocalWifiSwipe) {
             pendingLocalWifiSwipe = false;
             openLocalWifi();
         }
         if (pendingPlayingSwipe) {
-            lv_screen_load(pendingPlayingSwipe > 0 ? playingScreen : mainScreen);
+            lv_screen_load(pendingPlayingSwipe > 0 ? debugScreen : mainScreen);
             pendingPlayingSwipe = 0;
         }
         if (pendingScreenSwipe) {
@@ -2305,6 +2431,7 @@ void gui_task(void*) {
 /* ---------- Колбэки метаданных ---------- */
 // Получаю уведомление об окончании файла. В этой версии обработчик оставляет только отключённый диагностический вызов.
 void audio_eof_mp3(const char* info) {
+    if(sdActive.load()) sdEnded.store(true);
     streamLog("AUDIO EOF", "file ended: %s", info ? info : "");
 }
 // Получаю уведомление об окончании потока. Логику повторных попыток оставляю в аудиозадаче.
@@ -2405,20 +2532,14 @@ static void showStartupLogo() {
 /* ---------- Setup ---------- */
 // Выполняю однократный запуск: оборудование, очереди, сохранённые настройки и сеть, затем создаю аудиозадачу на ядре 0 и GUI на ядре 1. Заставка выполняется в GUI после создания экранов, без ожидания сети.
 void setup() {
-    if (STREAM_COM_DIAGNOSTICS) {
-        Serial.begin(115200);
-        Serial.setDebugOutput(true);
-        Serial.printf("[TLS_CORE_LOG] compiled_level=%d; runtime errors enabled; native client errors may appear outside FLOW lines\n", ARDUHAL_LOG_LEVEL);
-        streamLogQueue = xQueueCreate(24, sizeof(StreamLogLine));
-        if (streamLogQueue && xTaskCreate(streamComTask, "streamCOM", 4096, nullptr, 1, nullptr) == pdPASS)
-            streamLog("DIAG", "enabled; baud=115200; timeout=4000ms; FLOW every 1000ms; buffer bytes are occupancy, not network throughput");
-    }
+    // Application serial output is disabled.
+    Serial.setDebugOutput(false);
     pinMode(9, INPUT);
     analogSetPinAttenuation(9, ADC_11db);
     pinMode(PA_EN, OUTPUT);
     digitalWrite(PA_EN, LOW);
-    // Keep native error messages during the TLS investigation; no verbose logging.
-    esp_log_level_set("*", STREAM_COM_DIAGNOSTICS ? ESP_LOG_ERROR : ESP_LOG_NONE);
+    // Disable runtime ESP-IDF logging as well as compile-time Arduino logs.
+    esp_log_level_set("*", ESP_LOG_NONE);
     // Дисплей запускается перед прежней десятисекундной паузой.
     ledcAttach(TFT_BL, 5000, 8);
     ledcWrite(TFT_BL, 255);

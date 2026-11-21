@@ -29,11 +29,33 @@ input[type=range]{width:100%;accent-color:var(--blue);margin:16px 0;cursor:point
 #favorites:empty:before{content:"Пока нет избранных станций";color:#999;grid-column:1/-1;padding:16px 0}
 .minor button{font-size:15px;background:#202020}.settings{border-top:1px solid #333;padding-top:24px}.settings-grid{display:grid;grid-template-columns:1fr 1fr;gap:20px}label{display:block;color:#ccc}label select{margin-top:10px}#remaining{color:#bbb;margin-bottom:0}#error{color:#ff8585}#error:empty{display:none}footer{border-top:1px solid #333;color:#888;font-size:14px;margin-top:28px;padding-top:16px}
 @media(max-width:520px){body{padding:20px 16px}h1{font-size:32px}#station{font-size:24px}.settings-grid{grid-template-columns:1fr}#favorites button{font-size:20px}.minor{flex-direction:column}}
+details.mp3{background:#181818;padding:14px;margin:20px 0}details.mp3 summary{cursor:pointer;color:#80ff80}#mp3Name{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.mp3 .actions button{text-align:center;color:#80ff80;padding:10px;min-width:40px}.mp3 svg{width:22px;height:22px;fill:currentColor;shape-rendering:crispEdges}#mp3Files{max-height:300px;overflow:auto;margin:12px 0}#mp3Files button{display:block;width:100%;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;min-height:42px;padding:8px 12px;font-size:15px}#mp3Files button.current{background:#0078d7}#mp3Time,#mp3Page{font-size:14px;color:#bbb}
+/* MP3: компактный список и единый зелёный акцент, отдельно от радио. */
+details.mp3{background:#101410;border:1px solid #344438;border-top:3px solid #80ff80;padding:14px}
+.mp3 .actions{gap:6px}.mp3 .actions button{background:#243028;border:1px solid #3c5040;min-height:44px}
+#mp3Name{color:#e0ffe0;margin:16px 0 6px}#mp3Time{font-variant-numeric:tabular-nums;color:#a6b8aa}
+#mp3Files{background:#080c08;border:1px solid #344438}
+#mp3Files button{min-height:32px;padding:4px 10px;line-height:24px;background:#101410;color:#c8d8cc;border-bottom:1px solid #202a22}
+#mp3Files button.current{background:#183820;color:#80ff80;border-left:3px solid #80ff80;padding-left:7px}
+#mp3Seek{appearance:none;-webkit-appearance:none;accent-color:#80ff80;background:transparent;min-height:30px;margin:10px 0}
+#mp3Seek::-webkit-slider-runnable-track{height:14px;background:#29342c;border:1px solid #3c5040}
+#mp3Seek::-webkit-slider-thumb{-webkit-appearance:none;width:12px;height:22px;margin-top:-5px;background:#80ff80;border:1px solid #101410;border-radius:0}
+#mp3Seek::-moz-range-track{height:14px;background:#29342c;border:1px solid #3c5040}
+#mp3Seek::-moz-range-progress{height:14px;background:#80ff80}
+#mp3Seek::-moz-range-thumb{width:12px;height:22px;background:#80ff80;border:1px solid #101410;border-radius:0}
+#mp3Seek:disabled{opacity:.4}
 </style></head><body>
 <header><h1>Моё радио</h1><p class="subtitle">Домашний веб-пульт</p></header>
 <main><section aria-label="Текущая станция"><div class="now"><p id="station">Загрузка…</p><p id="status" aria-live="polite"></p><div class="actions minor" style="margin-top:14px"><button id="currentFavorite" disabled>Выберите станцию</button></div></div>
 <div class="actions"><button id="toggle" disabled>Пуск / Пауза</button><button id="stop">Остановить</button></div></section>
 <section class="section"><h2>Громкость <span class="value" id="volumeText"></span></h2><input aria-label="Громкость" id="volume" type="range" min="0" max="21"></section>
+<details class="mp3" id="mp3Panel"><summary>MP3 с SD-карты</summary>
+<p id="mp3Name">Файл не выбран</p><div id="mp3Time">00:00:00 / 00:00:00</div>
+<input id="mp3Seek" aria-label="Перемотка MP3" type="range" min="0" max="1" value="0" disabled>
+<div class="actions" id="mp3Controls"></div>
+<button id="mp3Retry">Прочитать SD-карту</button><p id="mp3Info"></p>
+<div id="mp3Files"></div><div class="actions minor"><button id="mp3PrevPage">←</button><span id="mp3Page"></span><button id="mp3NextPage">→</button></div>
+</details>
 <section class="section"><h2>Избранное <span id="favoriteCount" style="color:#aaa;font-size:18px">· 0 из 20</span></h2><div id="favorites"></div></section>
 <section class="section"><h2>Станции</h2><select aria-label="Выбор станции" id="stations"></select><div class="actions"><button id="play">Слушать выбранную</button></div>
 <p style="color:#aaa;margin:14px 0 8px">Выбранная станция</p><div class="actions minor"><button id="selectedFavorite" disabled>Выберите станцию</button></div></section>
@@ -59,6 +81,7 @@ button.onclick=()=>command(exists?'favremove':'favadd',id);
 async function command(action,value){try{const r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Radio-Control':'1'},body:new URLSearchParams({action,value:String(value??'')})});if(!r.ok)throw Error(await r.text());$('error').textContent='';await refresh()}catch(e){$('error').textContent='Команда не принята: '+e.message}}
 async function refresh(){if(busy)return;busy=true;try{const r=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(4000)});if(!r.ok)throw Error('HTTP '+r.status);const s=await r.json();remoteStateCache=s;$('station').textContent=s.name||'Станция не выбрана';$('status').textContent=s.status;$('toggle').textContent=s.requested?'Пауза':'Продолжить';$('toggle').disabled=s.station<0;if(!editing){$('volume').value=s.volume;$('volumeText').textContent=Math.round(s.volume*100/21)+'%'}if(!loaded){for(const x of s.stations){const o=document.createElement('option');o.value=x.id;o.textContent=x.name;$('stations').append(o)}loaded=true;if(s.station>=0)$('stations').value=s.station}if(!brightEditing){$('brightness').value=s.brightness;$('brightnessText').textContent=s.brightness+'%'}
 updateFavoriteButtons();
+updateMp3(s.mp3);
 if(document.activeElement!==$('sleep'))$('sleep').value=s.sleep;
 $('remaining').textContent=s.remaining?'До остановки радио: '+Math.ceil(s.remaining/60)+' мин':'Таймер радио выключен';
 const signature=JSON.stringify(s.favorites);if($('favorites').dataset.signature!==signature){$('favorites').dataset.signature=signature;$('favorites').replaceChildren();let colorIndex=0;for(const [slot,id] of s.favorites.entries()){if(id<0)continue;const button=document.createElement('button');button.dataset.slot=colorIndex++%9;button.textContent=s.stations[id].name;button.onclick=()=>command('play',id);$('favorites').append(button)}}
@@ -70,6 +93,33 @@ $('stations').onchange=updateFavoriteButtons;
 $('brightness').oninput=()=>{brightEditing=true;$('brightnessText').textContent=$('brightness').value+'%'};
 $('brightness').onchange=()=>{brightEditing=false;command('brightness',$('brightness').value)};
 $('sleep').onchange=()=>command('sleep',$('sleep').value);$('setTimer').onclick=()=>command('timer',$('timer').value);
+let mp3Page=0,mp3Track=-2,mp3Signature='',seekEditing=false;
+const clock=n=>[Math.floor(n/3600),Math.floor(n/60)%60,n%60].map(x=>String(x).padStart(2,'0')).join(':');
+const icons=[['sdprev','Предыдущий','M4 3h3v16H4z M18 3v16L8 11z'],['sdplay','Воспроизвести','M5 3v16l14-8z'],['sdpause','Пауза','M5 3h4v16H5z M13 3h4v16h-4z'],['sdstop','Стоп','M4 3h16v16H4z'],['sdnext','Следующий','M15 3h3v16h-3z M4 3v16l10-8z']];
+for(const [action,label,path] of icons){const b=document.createElement('button');b.title=label;b.setAttribute('aria-label',label);b.innerHTML='<svg viewBox="0 0 24 22" aria-hidden="true"><path d="'+path+'"/></svg>';b.onclick=()=>command(action);$('mp3Controls').append(b)}
+function updateMp3(m){if(!m)return;
+$('mp3Name').textContent=m.name||'Файл не выбран';$('mp3Time').textContent=clock(m.elapsed)+' / '+clock(m.duration);
+if(!seekEditing){$('mp3Seek').max=Math.max(1,m.duration-1);$('mp3Seek').value=m.elapsed}
+$('mp3Seek').disabled=!m.active||!m.duration;
+$('mp3Retry').hidden=m.scan===1||m.scan===2;
+$('mp3Info').textContent=m.scan===1?'Чтение карты…':m.scan===3?'Карта не обнаружена или не читается':m.scan===2?'Файлов: '+m.count+(m.paused?' · Пауза':m.active?' · Воспроизведение':''):'';
+$('mp3Controls').querySelectorAll('button').forEach(b=>b.disabled=m.scan!==2||!m.count);
+if(m.current!==mp3Track){mp3Track=m.current;if(m.current>=0){mp3Page=Math.floor(m.current/30);mp3Signature=''}}
+if($('mp3Panel').open)loadMp3Files();
+}
+async function loadMp3Files(){const m=remoteStateCache?.mp3;if(!m||m.scan!==2)return;
+const sig=mp3Page+':'+m.current+':'+m.count;if(sig===mp3Signature)return;
+try{const page=mp3Page;const r=await fetch('/api/mp3?page='+page,{cache:'no-store'});if(!r.ok)throw Error('HTTP '+r.status);const d=await r.json();if(page!==mp3Page)return;
+$('mp3Files').replaceChildren();for(const f of d.files){const b=document.createElement('button');b.textContent=f.name;b.title=f.name;b.className=f.id===m.current?'current':'';b.onclick=()=>command('sdfile',f.id);$('mp3Files').append(b)}
+$('mp3Page').textContent=(page+1)+' / '+Math.max(1,Math.ceil(m.count/30));$('mp3PrevPage').disabled=page===0;$('mp3NextPage').disabled=(page+1)*30>=m.count;mp3Signature=sig;
+$('mp3Files .current')?.scrollIntoView({block:'nearest'});
+}catch(e){$('error').textContent='Список MP3: '+e.message}}
+$('mp3Panel').ontoggle=()=>{if($('mp3Panel').open){if(remoteStateCache?.mp3.scan===0)command('sdscan');else loadMp3Files()}};
+$('mp3Retry').onclick=()=>command('sdscan');
+$('mp3PrevPage').onclick=()=>{if(mp3Page>0){mp3Page--;loadMp3Files()}};
+$('mp3NextPage').onclick=()=>{if((mp3Page+1)*30<(remoteStateCache?.mp3.count||0)){mp3Page++;loadMp3Files()}};
+$('mp3Seek').oninput=()=>seekEditing=true;
+$('mp3Seek').onchange=()=>{seekEditing=false;command('sdseek',$('mp3Seek').value)};
 refresh();setInterval(refresh,2000);
 </script></body></html>)HTML";
 
@@ -86,6 +136,25 @@ static String remoteJson(const char* text) {
 static esp_err_t remoteRoot(httpd_req_t* req) {
     httpd_resp_set_type(req, "text/html; charset=utf-8");
     return httpd_resp_send(req, remotePage, sizeof(remotePage)-1);
+}
+static String remoteMp3Name(int index) {
+    if(sdScanState.load()!=2 || index<0 || index>=int(sdMp3Files.size())) return "";
+    const String& path=sdMp3Files[index]; return path.substring(path.lastIndexOf('/')+1);
+}
+static esp_err_t remoteMp3Files(httpd_req_t* req) {
+    char query[32]={}, value[12]={}; int page=0;
+    if(httpd_req_get_url_query_str(req,query,sizeof(query))==ESP_OK && httpd_query_key_value(query,"page",value,sizeof(value))==ESP_OK) {
+        char* end; long n=strtol(value,&end,10);
+        if(!value[0]||*end||n<0||n>66) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid page");
+        page=int(n);
+    }
+    String body="{\"files\":[";
+    if(sdScanState.load()==2) {
+        int end=std::min((page+1)*30,int(sdMp3Files.size()));
+        for(int i=page*30;i<end;i++) {if(i!=page*30)body+=',';body+="{\"id\":"+String(i)+",\"name\":"+remoteJson(remoteMp3Name(i).c_str())+'}';}
+    }
+    body+="]}"; httpd_resp_set_type(req,"application/json; charset=utf-8");
+    httpd_resp_set_hdr(req,"Cache-Control","no-store"); return httpd_resp_send(req,body.c_str(),body.length());
 }
 static esp_err_t remoteState(httpd_req_t* req) {
     char status[96];
@@ -113,6 +182,12 @@ static esp_err_t remoteState(httpd_req_t* req) {
     body += "],\"brightness\":" + String(currentBrightness.load());
     body += ",\"sleep\":" + String(sleepChoice.load());
     body += ",\"remaining\":" + String(left>0 ? (left+999)/1000 : 0) + "}";
+    body.remove(body.length()-1);
+    body+=",\"mp3\":{\"scan\":"+String(sdScanState.load())+",\"count\":"+String(sdScanState.load()==2?sdMp3Files.size():0);
+    body+=",\"current\":"+String(sdCurrent.load())+",\"name\":"+remoteJson(remoteMp3Name(sdCurrent.load()).c_str());
+    body+=",\"active\":"; body+=sdActive.load()?"true":"false";
+    body+=",\"paused\":"; body+=sdPaused.load()?"true":"false";
+    body+=",\"elapsed\":"+String(sdElapsed.load())+",\"duration\":"+String(sdDuration.load())+"}}";
     httpd_resp_set_type(req, "application/json; charset=utf-8");
     httpd_resp_set_hdr(req, "Cache-Control", "no-store");
     return httpd_resp_send(req, body.c_str(), body.length());
@@ -134,6 +209,28 @@ static esp_err_t remoteControl(httpd_req_t* req) {
     }
     if (httpd_query_key_value(body,"action",action,sizeof(action)) != ESP_OK)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing action");
+    if(!strncmp(action,"sd",2)) {
+        if(!strcmp(action,"sdscan")) {sdWebScanRequested.store(true);return httpd_resp_send(req,"OK",2);}
+        if(sdScanState.load()!=2 || sdMp3Files.empty()) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"SD not ready");
+        int index=sdCurrent.load();
+        if(!strcmp(action,"sdfile") || !strcmp(action,"sdseek")) {
+            if(httpd_query_key_value(body,"value",value,sizeof(value))!=ESP_OK) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Missing value");
+            char* end; long n=strtol(value,&end,10);
+            long maximum=!strcmp(action,"sdfile")?long(sdMp3Files.size())-1:long(std::min(65535u,sdDuration.load()?sdDuration.load()-1:0u));
+            if(!value[0]||*end||n<0||n>maximum) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid value");
+            if(!strcmp(action,"sdseek")) {
+                if(!sdActive.load()||!sdDuration.load())return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Cannot seek");
+                sdSeekTrack.store(index);sdSeekSeconds.store(n);
+            }else{sdRequested.store(n);sdAction.store(1);}
+        }else if(!strcmp(action,"sdpause")){if(sdActive.load()&&!sdPaused.load())sdAction.store(2);}
+        else if(!strcmp(action,"sdstop"))sdAction.store(3);
+        else if(!strcmp(action,"sdplay")){if(!sdActive.load()||sdPaused.load()){sdRequested.store(index<0?0:index);sdAction.store(1);}}
+        else if(!strcmp(action,"sdprev")||!strcmp(action,"sdnext")) {
+            index=index<0?0:index+(!strcmp(action,"sdprev")?-1:1);
+            if(index>=0&&index<int(sdMp3Files.size())){sdRequested.store(index);sdAction.store(1);}
+        }else return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Unknown action");
+        return httpd_resp_send(req,"OK",2);
+    }
     // Настройки и избранное передаю GUI-задаче; здесь не трогаю LVGL и Preferences.
     int kind = !strcmp(action,"brightness") ? 0 : !strcmp(action,"sleep") ? 1 :
         !strcmp(action,"timer") ? 2 : !strcmp(action,"favadd") ? 3 : !strcmp(action,"favremove") ? 4 : -1;
@@ -198,6 +295,8 @@ static void startWebRemote() {
     httpd_uri_t root = {}; root.uri="/"; root.method=HTTP_GET; root.handler=remoteRoot;
     httpd_uri_t state = {}; state.uri="/api/state"; state.method=HTTP_GET; state.handler=remoteState;
     httpd_uri_t control = {}; control.uri="/api/control"; control.method=HTTP_POST; control.handler=remoteControl;
+    httpd_uri_t mp3 = {}; mp3.uri="/api/mp3"; mp3.method=HTTP_GET; mp3.handler=remoteMp3Files;
+    httpd_register_uri_handler(server,&mp3);
     httpd_register_uri_handler(server,&root);
     httpd_register_uri_handler(server,&state);
     httpd_register_uri_handler(server,&control);
