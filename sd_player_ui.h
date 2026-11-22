@@ -50,6 +50,11 @@ static void sdControl(lv_event_t* e) {
         sdSelected=index; sdRequested.store(index); sdAction.store(1);
     } else {sdRequested.store(sdSelected); sdAction.store(action);}
 }
+// Instant feedback uses LVGL's pressed state, without timers or animations.
+static void sdPressedStyle(lv_obj_t* b) {
+    lv_obj_set_style_bg_color(b,lv_color_hex(0x305c38),LV_STATE_PRESSED);
+    lv_obj_set_style_border_color(b,lv_color_hex(0x80ff80),LV_STATE_PRESSED);
+}
 // Crisp icons built from opaque, square pixels; no font glyphs or antialiasing.
 static void sdPixel(lv_obj_t* b,int x,int y,int w,int h) {
     lv_obj_t* p=lv_obj_create(b); lv_obj_remove_style_all(p);
@@ -157,8 +162,8 @@ static void sdLoadPlaylist() {
 }
 static void sdScanTask(void*) {
     SD_MMC.end(); sdMp3Files.clear(); sdFolders.clear(); sdScanLimited=false; sdCollectFolders=true;
-    SD_MMC.setPins(38,40,39);
-    if(!SD_MMC.begin("/sdcard",true,false) || SD_MMC.cardType()==CARD_NONE) sdScanState.store(3);
+    SD_MMC.setPins(38,40,39,41,48,47);
+    if(!SD_MMC.begin("/sdcard",false,false) || SD_MMC.cardType()==CARD_NONE) sdScanState.store(3);
     else {sdWalk("/",0); sdCollectFolders=false; sdLoadPlaylist(); if(!SD_MMC.exists("/.radio-playlist.txt")) sdSavePlaylist(); sdScanState.store(2);}
     vTaskDelete(nullptr);
 }
@@ -212,6 +217,7 @@ static lv_obj_t* sdButton(const char* text,int x,int y,int w,lv_event_cb_t cb,vo
     lv_obj_remove_flag(b,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_SCROLLABLE|LV_OBJ_FLAG_SCROLL_CHAIN_HOR|LV_OBJ_FLAG_SCROLL_CHAIN_VER));
     lv_obj_set_style_radius(b,0,0);
     lv_obj_set_style_bg_color(b,lv_color_hex(0x243028),0);
+    sdPressedStyle(b);
     lv_obj_set_style_border_width(b,1,0);
     lv_obj_set_style_border_color(b,lv_color_hex(0x3c5040),0);
     lv_obj_set_style_shadow_width(b,0,0);
@@ -268,6 +274,7 @@ static lv_obj_t* sdFolderButton(lv_obj_t* parent,const char* text,int x,int y,in
     lv_obj_set_style_border_width(b,0,0);
     lv_obj_set_style_radius(b,0,0); lv_obj_set_style_shadow_width(b,0,0);
     lv_obj_set_style_bg_color(b,lv_color_hex(0x243028),0);
+    sdPressedStyle(b);
     lv_obj_add_event_cb(b,cb,LV_EVENT_CLICKED,data);
     lv_obj_t* l=lv_label_create(b); lv_label_set_text(l,text); lv_obj_center(l);
     lv_obj_remove_flag(l,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE));
@@ -298,6 +305,8 @@ static void sdRefreshFolders() {
     lv_label_set_text(sdFolderTitle,sdFolderPath.c_str());
     lv_label_set_text(lv_obj_get_child(sdRecursiveButton,0),sdRecursive?"Подпапки: да":"Подпапки: нет");
     lv_obj_clean(sdFolderRows);
+    lv_obj_scroll_to_y(sdFolderRows,0,LV_ANIM_OFF);
+    size_t visibleFolders=0;
     String prefix=sdFolderPath=="/" ? "/" : sdFolderPath+"/";
     for(size_t i=0;i<sdFolders.size();++i) {
         const String& path=sdFolders[i];
@@ -305,9 +314,20 @@ static void sdRefreshFolders() {
         String name=path.substring(prefix.length());
         if(name.indexOf('/')>=0) continue;
         lv_obj_t* b=sdFolderButton(sdFolderRows,name.c_str(),0,0,196,sdFolderEnter,(void*)uintptr_t(i));
+        // Let a drag on a row reach the scrolling parent. LVGL suppresses
+        // CLICKED after a scroll, so swiping does not enter the folder.
+        lv_obj_add_flag(b,LV_OBJ_FLAG_SCROLL_CHAIN_VER);
+        ++visibleFolders;
         lv_obj_set_style_min_height(b,32,0);
+        lv_obj_set_style_text_color(b,lv_color_hex(0x80ff80),0);
         lv_obj_t* l=lv_obj_get_child(b,0); lv_obj_set_width(l,180);
         lv_label_set_long_mode(l,LV_LABEL_LONG_CLIP);
+    }
+    if(!visibleFolders) {
+        lv_obj_t* empty=lv_label_create(sdFolderRows);
+        lv_obj_set_width(empty,204);
+        lv_label_set_text(empty,"Нет подпапок");
+        lv_obj_set_style_text_color(empty,lv_color_hex(0x80ff80),0);
     }
 }
 static void sdOpenFolders(lv_event_t*) {
@@ -331,10 +351,15 @@ static void sdOpenFolders(lv_event_t*) {
         sdPixel(up,11,5,2,2);
         sdFolderButton(sdFolderPopup,"X",198,4,36,sdCloseFolders);
         sdFolderTitle=lv_label_create(sdFolderPopup); lv_obj_set_pos(sdFolderTitle,46,10);
-        lv_obj_set_width(sdFolderTitle,148); lv_label_set_long_mode(sdFolderTitle,LV_LABEL_LONG_CLIP);
+        lv_obj_set_width(sdFolderTitle,148); lv_label_set_long_mode(sdFolderTitle,LV_LABEL_LONG_SCROLL_CIRCULAR);
+        lv_obj_set_style_text_color(sdFolderTitle,lv_color_hex(0xffffff),0);
+        lv_obj_set_style_text_font(sdFolderTitle,&dejavu_16,0);
         sdFolderRows=lv_obj_create(sdFolderPopup); lv_obj_set_pos(sdFolderRows,4,40);
         lv_obj_set_size(sdFolderRows,230,116); lv_obj_set_flex_flow(sdFolderRows,LV_FLEX_FLOW_COLUMN);
         lv_obj_set_style_pad_all(sdFolderRows,4,0); lv_obj_set_scroll_dir(sdFolderRows,LV_DIR_VER);
+        lv_obj_add_flag(sdFolderRows,LV_OBJ_FLAG_SCROLLABLE);
+        lv_obj_set_scrollbar_mode(sdFolderRows,LV_SCROLLBAR_MODE_AUTO);
+        lv_obj_set_style_text_font(sdFolderRows,&dejavu_16,0);
         lv_obj_set_style_bg_color(sdFolderRows,lv_color_hex(0x101410),0);
         sdRecursiveButton=sdFolderButton(sdFolderPopup,"",4,160,230,sdToggleRecursive);
         sdFolderButton(sdFolderPopup,"Выбрать",4,198,112,sdApplyFolder,(void*)1);
@@ -356,7 +381,7 @@ static void buildDebugScreen() {
     lv_obj_remove_flag(debugScreen,LV_OBJ_FLAG_SCROLLABLE);
     navigationArrow(sdButton("",4,4,36,debugBackEvent),false,0x80ff80);
     sdTime=mustLabel(debugScreen,"sdTitle");
-    lv_label_set_text(sdTime,"MP3 - 00:00:00/00:00:00");
+    lv_label_set_text(sdTime,"MP3");
     lv_obj_set_pos(sdTime,44,10); lv_obj_set_width(sdTime,158);
     lv_obj_set_style_text_letter_space(sdTime,-1,0);
     lv_label_set_long_mode(sdTime,LV_LABEL_LONG_CLIP);
@@ -367,7 +392,7 @@ static void buildDebugScreen() {
         lv_obj_t* b=sdButton("",4+i*47,42,43,sdControl,(void*)uintptr_t(actions[i]));
         sdIcon(b,actions[i]);
     }
-    sdProgress=lv_bar_create(debugScreen); lv_obj_set_pos(sdProgress,6,107);
+    sdProgress=lv_bar_create(debugScreen); lv_obj_set_pos(sdProgress,6,100);
     lv_obj_set_size(sdProgress,228,14); lv_bar_set_range(sdProgress,0,1000);
     lv_obj_set_style_radius(sdProgress,0,0);
     lv_obj_set_style_bg_color(sdProgress,lv_color_hex(0x29342c),0);
@@ -381,7 +406,7 @@ static void buildDebugScreen() {
     sdMessage=mustLabel(debugScreen,"sdMessage"); lv_obj_set_pos(sdMessage,6,80); lv_obj_set_width(sdMessage,228); lv_label_set_long_mode(sdMessage,LV_LABEL_LONG_SCROLL_CIRCULAR);
     lv_label_set_text(sdMessage,"Проверка SD карты...");
     sdFileList=mustCreate(debugScreen,"sdFiles");
-    lv_obj_set_pos(sdFileList,4,126); lv_obj_set_size(sdFileList,232,151);
+    lv_obj_set_pos(sdFileList,4,119); lv_obj_set_size(sdFileList,232,158);
     lv_obj_set_style_bg_color(sdFileList,lv_color_hex(0x000000),0);
     lv_obj_set_style_radius(sdFileList,0,0);
     lv_obj_set_style_pad_all(sdFileList,4,0);
@@ -394,11 +419,11 @@ static void buildDebugScreen() {
     navigationArrow(sdButton("",196,284,40,sdPageEvent,(void*)1),true,0x80ff80);
     sdPageLabel=mustLabel(debugScreen,"sdPage"); lv_obj_set_pos(sdPageLabel,50,291);
     lv_obj_t* folder=sdButton("",146,284,44,sdOpenFolders);
-    sdPixel(folder,9,7,12,4); sdPixel(folder,7,11,30,15);
-    lv_obj_t* inset=lv_obj_create(folder); lv_obj_remove_style_all(inset);
-    lv_obj_set_pos(inset,9,13); lv_obj_set_size(inset,26,11);
-    lv_obj_set_style_bg_color(inset,lv_color_hex(0x243028),0); lv_obj_set_style_bg_opa(inset,LV_OPA_COVER,0);
-    lv_obj_remove_flag(inset,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE));
+    // Narrow, centred outline; the open centre shows the pressed background.
+    sdPixel(folder,11,7,10,4);
+    sdPixel(folder,9,11,26,2);
+    sdPixel(folder,9,13,2,11); sdPixel(folder,33,13,2,11);
+    sdPixel(folder,9,24,26,2);
 }
 // Display only the immediate parent folder; root files use ".".
 static String sdPlayingCaption(const String& path) {
@@ -409,6 +434,13 @@ static String sdPlayingCaption(const String& path) {
         folder=parent.substring(parent.lastIndexOf('/')+1);
     }
     return folder + " \\ " + path.substring(slash+1);
+}
+// Omit zero hours, but keep every displayed unit two digits wide.
+static void sdFormatTime(char* text, size_t size, unsigned seconds) {
+    if(seconds>=3600)
+        snprintf(text,size,"%02u:%02u:%02u",seconds/3600,(seconds/60)%60,seconds%60);
+    else
+        snprintf(text,size,"%02u:%02u",seconds/60,seconds%60);
 }
 static void updateSdPlayer() {
     static bool wasVisible=false;
@@ -422,6 +454,7 @@ static void updateSdPlayer() {
     if(!visible) return;
     if(state==1) {shown=1; return;}
     static int oldTrack=-2; static unsigned oldElapsed=~0u,oldDuration=~0u;
+    static bool oldTimeVisible=false;
     int track=sdCurrent.load(); unsigned elapsed=sdElapsed.load(),duration=sdDuration.load();
     if(track!=oldTrack || entering) {
         oldTrack=track;
@@ -434,11 +467,15 @@ static void updateSdPlayer() {
             sdShowPage(true,samePage);
         }
     }
-    if(elapsed!=oldElapsed || duration!=oldDuration) {
-        oldElapsed=elapsed; oldDuration=duration; char t[64];
-        snprintf(t,sizeof(t),"MP3 - %02u:%02u:%02u/%02u:%02u:%02u",
-                 elapsed/3600,(elapsed/60)%60,elapsed%60,
-                 duration/3600,(duration/60)%60,duration%60);
+    bool timeVisible=sdActive.load() && (elapsed>0 || duration>0);
+    if(elapsed!=oldElapsed || duration!=oldDuration || timeVisible!=oldTimeVisible || entering) {
+        oldElapsed=elapsed; oldDuration=duration; oldTimeVisible=timeVisible;
+        char t[64], current[24], total[24];
+        if(timeVisible) {
+            sdFormatTime(current,sizeof(current),elapsed);
+            sdFormatTime(total,sizeof(total),duration);
+            snprintf(t,sizeof(t),"MP3 - %s/%s",current,total);
+        } else snprintf(t,sizeof(t),"MP3");
         lv_label_set_text(sdTime,t);
         lv_bar_set_value(sdProgress,duration?std::min(1000u,unsigned(uint64_t(elapsed)*1000/duration)):0,LV_ANIM_OFF);
     }

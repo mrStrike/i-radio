@@ -168,7 +168,7 @@ static void buildLocalWifiScreen() {
     lv_obj_set_style_text_color(localWifiScreen, lv_color_hex(0xffffff), 0);
     lv_obj_set_style_text_font(localWifiScreen, &wifi_ui_font, 0);
     lv_obj_remove_flag(localWifiScreen, LV_OBJ_FLAG_SCROLLABLE);
-    localWifiButton(localWifiScreen, "Назад", 4, 4, 108, backEvent);
+    localWifiButton(localWifiScreen, "Назад", 4, 4, 108, [](lv_event_t*) { lv_screen_load(settingsScreen); });
     localWifiButton(localWifiScreen, "Обновить", 120, 4, 116, localWifiScanEvent);
     localWifiStatus = mustLabel(localWifiScreen, "localWifiStatus");
     lv_obj_set_pos(localWifiStatus, 6, 42); lv_obj_set_size(localWifiStatus, 228, 48);

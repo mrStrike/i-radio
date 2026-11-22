@@ -397,11 +397,14 @@ static lv_obj_t* mainScreen = nullptr;
 static lv_obj_t* listScreen = nullptr;
 static lv_obj_t* settingsScreen = nullptr;
 static lv_obj_t* debugScreen = nullptr;
+static lv_obj_t* galleryScreen = nullptr;
+static bool photoViewing=false;
 static lv_obj_t* pendingScreenSwipe = nullptr;
 static lv_obj_t* remoteAddressLabel = nullptr;
 static lv_obj_t* wifiScreen = nullptr;
 static lv_obj_t* volumeSlider = nullptr;
 static lv_obj_t* volumeLabel = nullptr;
+static lv_obj_t* globalVolumeButton=nullptr;
 static lv_obj_t *volumeOverlay = nullptr, *popupVolumeSlider = nullptr, *popupVolumeLabel = nullptr;
 static bool sdFolderPopupOpen=false;
 static bool volumePopupOpen = false;
@@ -701,20 +704,22 @@ static void touchRead(lv_indev_t*, lv_indev_data_t* data) {
     static lv_obj_t* startScreen = nullptr;
     if (p && !tracking) {
         tracking = true; horizontal = false;
-        blockNavigation = sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
+        blockNavigation = photoViewing || sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
         startX = x; startY = y; startScreen = lv_screen_active();
     }
     if (p && volumePopupOpen) volumePopupActivity = millis();
-    if (p && tracking && !blockNavigation && !volumePopupOpen && (startScreen == mainScreen || startScreen == settingsScreen || startScreen == debugScreen)) {
+    if (p && tracking && !blockNavigation && !volumePopupOpen && (startScreen == mainScreen || startScreen == settingsScreen || startScreen == debugScreen || startScreen == galleryScreen)) {
         int dx = x - startX, dy = y - startY;
         if (!horizontal && abs(dx) >= 45 && abs(dx) > abs(dy) * 2) {
             horizontal = true;
             lv_indev_wait_release(lv_indev_active());
             if (startScreen == mainScreen && dx < 0) pendingPlayingSwipe = 1;
-            if (startScreen == mainScreen && dx > 0) pendingLocalWifiSwipe = true;
+            if (startScreen == mainScreen && dx > 0) pendingScreenSwipe = settingsScreen;
             if (startScreen == debugScreen && dx > 0) pendingPlayingSwipe = -1;
-            if (startScreen == debugScreen && dx < 0) pendingScreenSwipe = settingsScreen;
-            if (startScreen == settingsScreen && dx > 0) pendingScreenSwipe = debugScreen;
+            if (startScreen == debugScreen && dx < 0) pendingScreenSwipe = galleryScreen;
+            if (startScreen == settingsScreen && dx < 0) pendingScreenSwipe = mainScreen;
+            if (startScreen == settingsScreen && dx > 0) pendingLocalWifiSwipe = true;
+            if (startScreen == galleryScreen && dx > 0) pendingScreenSwipe = debugScreen;
         }
     }
     if (!p) { tracking = false; horizontal = false; }
@@ -929,6 +934,7 @@ static void buildVolumePopup() {
     lv_obj_add_flag(volumeOverlay, LV_OBJ_FLAG_HIDDEN);
     // Opaque square pixels, no glyphs or antialiasing.
     lv_obj_t* button = mustButton(top, "globalVolume");
+    globalVolumeButton=button;
     lv_obj_set_pos(button, 204, 2); lv_obj_set_size(button, 34, 34);
     lv_obj_set_style_pad_all(button, 0, 0);
     lv_obj_set_style_bg_color(button, lv_color_hex(0x18221b), 0);
@@ -1359,6 +1365,7 @@ static void hideAuthorEvent(lv_event_t* e) {
 }
 // First SD-player milestone: read-only discovery; audio ownership unchanged.
 #include "sd_player_ui.h"
+#include "photo_gallery.h"
 
 /* ---------- Настройки ---------- */
 // Создаю громкость, яркость, сон дисплея, таймер радио, настройку сети и окно автора. Ползунки связаны с отдельными обработчиками; построение экрана не запускает их действия вручную.
@@ -2308,6 +2315,7 @@ void gui_task(void*) {
     LOG("BOOT", "building Settings screen");
     buildSettingsScreen();
     buildDebugScreen();
+    buildGalleryScreen();
     LOG("BOOT", "building Wifi screen");
     buildWifiScreen();
     buildLocalWifiScreen();
@@ -2405,6 +2413,7 @@ void gui_task(void*) {
         }
         // LVGL обслуживает касания и перерисовку; сон ниже выключает только подсветку, аудиозадача продолжает работать.
         refreshLocalWifi();
+        updateGallery();
         lv_timer_handler();
         if (volumePopupOpen && millis() - volumePopupActivity >= 3000)
             closeVolumePopup(nullptr);
@@ -2532,7 +2541,8 @@ static void showStartupLogo() {
 /* ---------- Setup ---------- */
 // Выполняю однократный запуск: оборудование, очереди, сохранённые настройки и сеть, затем создаю аудиозадачу на ядре 0 и GUI на ядре 1. Заставка выполняется в GUI после создания экранов, без ожидания сети.
 void setup() {
-    // Application serial output is disabled.
+    // Temporary gallery timing only; general logging stays disabled.
+    Serial.begin(115200);
     Serial.setDebugOutput(false);
     pinMode(9, INPUT);
     analogSetPinAttenuation(9, ADC_11db);
