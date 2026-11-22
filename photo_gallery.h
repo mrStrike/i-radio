@@ -313,9 +313,6 @@ static void photoExifWriter(void*) {
         const char* status=photoSaveExif(photoFiles[job.index],job.pixels,job.w,job.h,timing);
         xSemaphoreGive(photoFileMutex);
         free(job.pixels);
-        #if 0 // Optional gallery diagnostics; disabled during normal use.
-        Serial.printf("[PHOTO] EXIF file=%s exif_write=%s copy_ms=%.1f\n",photoFiles[job.index].c_str(),status,double(timing.copy)/1000.0);
-        #endif
         vTaskDelay(1);
     }
 }
@@ -497,18 +494,6 @@ static void photoWorker(void*) {
         }
         uint64_t totalUs=esp_timer_get_time()-startedUs;
         uint64_t processingUs=decodeUs>timed.ioUs?decodeUs-timed.ioUs:0;
-        #if 0 // Optional gallery diagnostics; disabled during normal use.
-        Serial.printf("[PHOTO] %s file=%s size=%u dims=%dx%d read=%u SD_ms=%.1f process_ms=%.1f total_ms=%.1f save_ms=%.1f encode_ms=%.1f prepare_ms=%.1f copy_ms=%.1f flush_ms=%.1f verify_ms=%.1f rename_ms=%.1f remove_ms=%.1f exif_found=%d old_app1_size=%u new_app1_size=%u inplace_possible=%d ok=%d source=%s exif_write=%s\n",
-            large?"FULL":"THUMB",photoFiles[index].c_str(),unsigned(fileBytes),w,h,
-            unsigned(timed.bytes),double(timed.ioUs)/1000.0,double(processingUs)/1000.0,
-            double(totalUs)/1000.0,double(saveUs)/1000.0,
-            double(saveTiming.encode)/1000.0,double(saveTiming.prepare)/1000.0,
-            double(saveTiming.copy)/1000.0,double(saveTiming.flush)/1000.0,
-            double(saveTiming.verify)/1000.0,double(saveTiming.rename)/1000.0,
-            double(saveTiming.remove)/1000.0,int(saveTiming.exifFound),
-            unsigned(saveTiming.oldApp1Size),unsigned(saveTiming.newApp1Size),
-            int(saveTiming.inplacePossible),int(photoResultOk),source,saved);
-        #endif
         if(large && photoResultOk && photoFileMutex) photoDiskSave(photoFiles[index],photoPixels);
         photoPhase.store(0);
         photoResult.store(index);

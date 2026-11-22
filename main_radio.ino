@@ -14,7 +14,14 @@
 #include <LovyanGFX.hpp>
 #include <lvgl.h>
 #include <Audio.h>
-#include "audio_stream_probe.h"
+
+// Resume API differs between audioI2S 3.x (bytes) and 4.x (seconds).
+// This compatibility check is needed even when diagnostics are removed.
+#if __has_include("audiolib_structs.hpp") && __has_include("psram_unique_ptr.hpp")
+#define AUDIO_RESUME_SECONDS 1
+#else
+#define AUDIO_RESUME_SECONDS 0
+#endif
 #include <esp_heap_caps.h>
 #include <esp_system.h>
 #include <freertos/queue.h>
@@ -27,8 +34,6 @@
 #include <math.h>
 #include <atomic>
 #include <time.h>
-#include <stdarg.h>
-#include <errno.h>
 #include <string.h>
 #include "stations.h"
 
@@ -59,7 +64,6 @@ constexpr int STATION_COUNT = FAVORITES_COUNT;
 // Сохраняю распиновку встроенного звукового тракта: разрешение усилителя и линии цифрового звука I2S.
 constexpr int PA_EN = 1, MCLK = 4, BCLK = 5, DOUT = 8, LRCK = 7;
 constexpr int TP_SDA = 16, TP_SCL = 15, TP_RST = 18, TP_INT = 17, TFT_BL = 45;
-static constexpr bool RADIO_DIAGNOSTICS = false;
 // Кодек и сенсор используют одну I2C-шину. WireGuard берёт mutex при входе и освобождает при выходе из области видимости.
 static SemaphoreHandle_t wireDiagMutex;
 struct WireGuard {
@@ -70,136 +74,9 @@ struct WireGuard {
         if (wireDiagMutex) xSemaphoreGive(wireDiagMutex);
     }
 };
-// Logging is compiled out: arguments are not evaluated in the hot paths.
-#define LOG(...) ((void)0)
-#define LOGE(...) ((void)0)
-// Temporary stream diagnostics. Disable this switch after investigation.
-static constexpr bool STREAM_COM_DIAGNOSTICS = false;
-static std::atomic<bool> streamDiagTarget{false};
-static QueueHandle_t streamLogQueue = nullptr;
-static std::atomic<uint32_t> streamLogDropped{0};
-struct StreamLogLine { char text[384]; };
-static void streamLog(const char* tag, const char* fmt, ...) {
-    if (!STREAM_COM_DIAGNOSTICS || !streamDiagTarget.load() || !streamLogQueue) return;
-    StreamLogLine line{};
-    int prefix = snprintf(line.text, sizeof(line.text), "[%lu] %s ", (unsigned long)millis(), tag);
-    if (prefix < 0 || size_t(prefix) >= sizeof(line.text)) return;
-    va_list args;
-    va_start(args, fmt);
-    vsnprintf(line.text + prefix, sizeof(line.text) - prefix, fmt, args);
-    va_end(args);
-    if (xQueueSend(streamLogQueue, &line, 0) != pdTRUE) ++streamLogDropped;
-}
-// No diagnostic formatting or argument evaluation in playback paths.
-#define streamLog(...) ((void)0)
-// Wrap the existing TLS receive callback, without reading extra bytes or
-// changing return values. Capture errno before logging/cleanup can overwrite it.
-#ifndef MBEDTLS_PRIVATE
-#define MBEDTLS_PRIVATE(member) member
-#endif
-static mbedtls_ssl_recv_t* diagOriginalRecv = nullptr;
-static int diagTLSRecv(void* context, unsigned char* bytes, size_t length) {
-    const int result = diagOriginalRecv(context, bytes, length);
-    const int savedErrno = errno;
-    if (result < 0 && result != MBEDTLS_ERR_SSL_WANT_READ &&
-        result != MBEDTLS_ERR_SSL_WANT_WRITE) {
-        streamLog("TLS_RECV", "ret=%d errno=%d text=%s requested=%u", result,
-                  savedErrno, strerror(savedErrno), unsigned(length));
-    } else if (result == 0) {
-        streamLog("TLS_RECV", "ret=0 EOF requested=%u", unsigned(length));
-    }
-    errno = savedErrno;
-    return result;
-}
-static void installTLSReceiveProbe(Audio& audio) {
-    if (!STREAM_COM_DIAGNOSTICS || !streamDiagTarget.load() ||
-        !(audio.*probeMember(ProbeSSL{}))) return;
-    auto& secure = audio.*probeMember(ProbeSecureClient{});
-    auto context = secure.*probeTLSContext(ProbeTLSContext{});
-    if (!context) return;
-    auto& ssl = context->ssl_ctx;
-    auto original = ssl.MBEDTLS_PRIVATE(f_recv);
-    if (!original || original == diagTLSRecv) return;
-    diagOriginalRecv = original;
-    ssl.MBEDTLS_PRIVATE(f_recv) = diagTLSRecv;
-    streamLog("TLS_PROBE", "installed; original BIO context and receive result preserved");
-}
-
-// Measured pointer movement: counts input-buffer bytes, not TLS/network bytes.
-static uint32_t diagReadPos = 0, diagWritePos = 0, diagLastReadAt = 0, diagLastWriteAt = 0;
-static uint64_t diagBytesRead = 0, diagBytesWritten = 0;
-static int diagPreviousConnected = -1;
-static bool diagPointersReady = false;
-static bool diagPositionsSupported = false;
-static void sampleAudioBuffer(Audio& audio) {
-    if (!streamDiagTarget.load()) return;
-    auto& buffer = audio.*probeMember(ProbeInput{});
-    uint32_t r = 0, w = 0;
-    diagPositionsSupported = probeBufferPositions(buffer, r, w, 0);
-    if (!diagPositionsSupported) { diagPointersReady = false; return; }
-    uint32_t capacity = audio.inBufferFilled() + audio.inBufferFree();
-    if (diagPointersReady && capacity) {
-        uint32_t dr = r >= diagReadPos ? r-diagReadPos : capacity-diagReadPos+r;
-        uint32_t dw = w >= diagWritePos ? w-diagWritePos : capacity-diagWritePos+w;
-        if (dr) { diagBytesRead += dr; diagLastReadAt = millis(); }
-        if (dw) { diagBytesWritten += dw; diagLastWriteAt = millis(); }
-    }
-    diagReadPos = r; diagWritePos = w; diagPointersReady = true;
-}
-static void logAudioInternal(Audio& audio) {
-    if (!STREAM_COM_DIAGNOSTICS || !streamDiagTarget.load()) return;
-    // Called only by the audio task, once per snapshot and before stopSong.
-    // Never read/peek/stop the client here: do not consume stream bytes.
-    unsigned long available = (audio.*probeMember(ProbeAvailable{}))();
-    streamLog("INTERNAL", "net_available=%lu stream_type=%u interval=%lu until_meta=%lu chunked=%d valid_samples=%d current_sample=%d",
-        available, unsigned(audio.*probeMember(ProbeType{})),
-        (unsigned long)(audio.*probeMember(ProbeMetaInterval{})),
-        (unsigned long)(audio.*probeMember(ProbeMetaCount{})),
-        int(audio.*probeMember(ProbeChunked{})),
-        int(audio.*probeMember(ProbeValid{})), int(audio.*probeMember(ProbeCurrent{})));
-    // connected() can affect client state; measure its cost, never read bytes.
-    auto* client = audio.*probeMember(ProbeClient{});
-    uint32_t checkStart = micros();
-    int connected = client ? int(client->connected()) : -1;
-    uint32_t checkUs = micros() - checkStart;
-    if (diagPreviousConnected == 1 && connected == 0 &&
-        (audio.*probeMember(ProbeSSL{}))) {
-        char errorText[160]{};
-        auto& secureClient = audio.*probeMember(ProbeSecureClient{});
-        int errorCode = secureClient.lastError(errorText, sizeof(errorText));
-        streamLog("TLS_DROP", "stored_code=%d stored_text=%s (not necessarily the cause of disconnect)", errorCode,
-            errorText[0] ? errorText : "no stored TLS error");
-    }
-    diagPreviousConnected = connected;
-    long long inputPosition = -1;
-#if AUDIO_PROBE_V4
-    inputPosition = audio.*probeMember(ProbePosition{});
-#endif
-    streamLog("HTTPS", "probe_v4=%d client_present=%d ssl=%d connected=%d mode=%u input_position=%lld connected_us=%lu",
-        AUDIO_PROBE_V4, int(client != nullptr), int(audio.*probeMember(ProbeSSL{})),
-        connected, unsigned(audio.*probeMember(ProbeMode{})), inputPosition,
-        (unsigned long)checkUs);
-    auto& buffer = audio.*probeMember(ProbeInput{});
-    streamLog("BUFFER", "positions_supported=%d read_pos=%lu write_pos=%lu consumed=%llu added=%llu read_age_ms=%ld write_age_ms=%ld max_block=%u filled_gt_block=%d write_space=%lu stack_free=%lu heap_min=%lu heap_largest=%lu",
-        int(diagPositionsSupported), (unsigned long)diagReadPos, (unsigned long)diagWritePos,
-        (unsigned long long)diagBytesRead, (unsigned long long)diagBytesWritten,
-        diagLastReadAt ? long(millis()-diagLastReadAt) : -1L,
-        diagLastWriteAt ? long(millis()-diagLastWriteAt) : -1L,
-        unsigned(buffer.getMaxBlockSize()), int(audio.inBufferFilled()>buffer.getMaxBlockSize()),
-        (unsigned long)buffer.writeSpace(), (unsigned long)uxTaskGetStackHighWaterMark(nullptr),
-        (unsigned long)ESP.getMinFreeHeap(),
-        (unsigned long)heap_caps_get_largest_free_block(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
-}
-static void streamComTask(void*) {
-    StreamLogLine line;
-    for (;;) {
-        if (xQueueReceive(streamLogQueue, &line, portMAX_DELAY) == pdTRUE)
-            (void)line; // No serial output.
-    }
-}
 // При невосстановимой ошибке отключаю усилитель и останавливаю выполнение. Не продолжаю запуск с отсутствующей памятью или неготовым оборудованием.
 static void fatal(const char* text) {
-    LOGE("FATAL", "%s", text);
+
     digitalWrite(PA_EN, HIGH);
     for (;;) vTaskDelay(pdMS_TO_TICKS(1000));
 }
@@ -262,7 +139,7 @@ static void pushStatus(const char* text) {
     e.type = UI_STATUS;
     strlcpy(e.text, text, sizeof(e.text));
     xQueueOverwrite(uiEventQueue, &e);
-    LOG("STATUS", "%s", text);
+
 }
 // Передаю метаданные тем же механизмом очереди. Сейчас GUI их принимает, но не выводит название композиции на экран.
 static void pushMetadata(const char* text) {
@@ -271,7 +148,7 @@ static void pushMetadata(const char* text) {
     e.type = UI_METADATA;
     strlcpy(e.text, text, sizeof(e.text));
     xQueueOverwrite(uiEventQueue, &e);
-    LOG("META", "%s", text);
+
 }
 /* ---------- ES8311 ---------- */
 // Записываю одну пару «регистр — значение» в ES8311 по адресу 0x18. Блокировка защищает общую I2C-шину от одновременного обращения сенсора и кодека; ошибка возвращается вызывающему коду.
@@ -280,9 +157,7 @@ static bool codecWrite(uint8_t r, uint8_t v) {
     Wire.beginTransmission(0x18);
     Wire.write(r);
     Wire.write(v);
-    uint8_t err = Wire.endTransmission();
-    if (err) LOGE("CODEC", "reg=0x%02X value=0x%02X I2C error=%u", r, v, err);
-    return err == 0;
+    return Wire.endTransmission() == 0;
 }
 // Запускаю ES8311 двумя проверенными таблицами регистров и задержками. Порядок записей и значения сохраняю без изменений: это рабочая настройка звукового тракта, а не оформление интерфейса.
 static bool es8311_init() {
@@ -365,7 +240,7 @@ static bool es8311_init() {
     for (auto &r : run) if (!codecWrite(r[0], r[1])) return false;
     if (!codecWrite(0x00, 0x80)) return false;
     delay(20);
-    LOG("CODEC", "ES8311 final REG00=0x80; DAC volume REG32=0xBF (0 dB)");
+
     return true;
 }
 /* ---------- Тач ---------- */
@@ -400,6 +275,8 @@ static lv_obj_t* debugScreen = nullptr;
 static lv_obj_t* galleryScreen = nullptr;
 static bool photoViewing=false;
 static lv_obj_t* pendingScreenSwipe = nullptr;
+static lv_obj_t* alarmScreen = nullptr;
+static bool scheduleTimePopupOpen = false;
 static lv_obj_t* remoteAddressLabel = nullptr;
 static lv_obj_t* wifiScreen = nullptr;
 static lv_obj_t* volumeSlider = nullptr;
@@ -561,7 +438,7 @@ static bool sameStation(int a, int b) {
 }
 // Отправляю команду аудиозадаче без ожидания свободного места. GUI не должен блокироваться на работе звукового тракта; переполнение остаётся в существующей ветке диагностики.
 static void sendCommand(Command c) {
-    if (xQueueSend(audioCmdQueue, &c, 0) != pdTRUE) LOGE("UI", "command queue full");
+    (void)xQueueSend(audioCmdQueue, &c, 0);
 }
 // Передаю запрос Play/Pause аудиозадаче. Сам объект Audio из обработчика интерфейса не вызываю.
 static void toggleEvent(lv_event_t*) {
@@ -638,7 +515,7 @@ static void setTileText(lv_obj_t* label, const char* name, int width) {
 static lv_obj_t* mustCreate(lv_obj_t* parent, const char* name) {
     lv_obj_t* o = lv_obj_create(parent);
     if (!o) {
-        LOGE("UI", "create '%s' NULL", name);
+
         fatal("LVGL OOM");
     }
     return o;
@@ -647,7 +524,7 @@ static lv_obj_t* mustCreate(lv_obj_t* parent, const char* name) {
 static lv_obj_t* mustButton(lv_obj_t* parent, const char* name) {
     lv_obj_t* o = lv_button_create(parent);
     if (!o) {
-        LOGE("UI", "button '%s' NULL", name);
+
         fatal("LVGL OOM");
     }
     lv_obj_remove_style_all(o);
@@ -661,7 +538,7 @@ static lv_obj_t* mustButton(lv_obj_t* parent, const char* name) {
 static lv_obj_t* mustLabel(lv_obj_t* parent, const char* name) {
     lv_obj_t* o = lv_label_create(parent);
     if (!o) {
-        LOGE("UI", "label '%s' NULL", name);
+
         fatal("LVGL OOM");
     }
     return o;
@@ -704,20 +581,22 @@ static void touchRead(lv_indev_t*, lv_indev_data_t* data) {
     static lv_obj_t* startScreen = nullptr;
     if (p && !tracking) {
         tracking = true; horizontal = false;
-        blockNavigation = photoViewing || sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
+        blockNavigation = scheduleTimePopupOpen || photoViewing || sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
         startX = x; startY = y; startScreen = lv_screen_active();
     }
     if (p && volumePopupOpen) volumePopupActivity = millis();
-    if (p && tracking && !blockNavigation && !volumePopupOpen && (startScreen == mainScreen || startScreen == settingsScreen || startScreen == debugScreen || startScreen == galleryScreen)) {
+    if (p && tracking && !blockNavigation && !volumePopupOpen && (startScreen == mainScreen || startScreen == settingsScreen || startScreen == alarmScreen || startScreen == debugScreen || startScreen == galleryScreen)) {
         int dx = x - startX, dy = y - startY;
         if (!horizontal && abs(dx) >= 45 && abs(dx) > abs(dy) * 2) {
             horizontal = true;
             lv_indev_wait_release(lv_indev_active());
             if (startScreen == mainScreen && dx < 0) pendingPlayingSwipe = 1;
-            if (startScreen == mainScreen && dx > 0) pendingScreenSwipe = settingsScreen;
+            if (startScreen == mainScreen && dx > 0) pendingScreenSwipe = alarmScreen;
             if (startScreen == debugScreen && dx > 0) pendingPlayingSwipe = -1;
             if (startScreen == debugScreen && dx < 0) pendingScreenSwipe = galleryScreen;
-            if (startScreen == settingsScreen && dx < 0) pendingScreenSwipe = mainScreen;
+            if (startScreen == alarmScreen && dx < 0) pendingScreenSwipe = mainScreen;
+            if (startScreen == alarmScreen && dx > 0) pendingScreenSwipe = settingsScreen;
+            if (startScreen == settingsScreen && dx < 0) pendingScreenSwipe = alarmScreen;
             if (startScreen == settingsScreen && dx > 0) pendingLocalWifiSwipe = true;
             if (startScreen == galleryScreen && dx > 0) pendingScreenSwipe = debugScreen;
         }
@@ -737,7 +616,7 @@ static void setBrightness(int percent) {
     currentBrightness = percent;
     int duty = (percent * 255) / 100;
     if (!displaySleeping) ledcWrite(TFT_BL, duty);
-    LOG("UI", "brightness=%d%% duty=%d", percent, duty);
+
 }
 // Меняю цвет пиксельного Wi-Fi и видимость перечёркивания только при изменении подключения. Этот значок показывает наличие сети, а не качество аудиопотока.
 static void updateWifiIndicator() {
@@ -852,11 +731,11 @@ static void allStationEvent(lv_event_t* e) {
 }
 // Передаю команду существующего WAV-теста через аудиоочередь. Здесь не создаю отдельный низкоуровневый I2S-драйвер.
 static void toneEvent(lv_event_t*) {
-    LOG("TONE GUI", "CLICKED; sending toggle; active snapshot=%d", int(testToneActive));
+
     Command c{
         CMD_TEST_TONE, 0
     };
-    if (xQueueSend(audioCmdQueue, &c, 0) != pdTRUE) LOGE("TONE", "command queue full");
+    (void)xQueueSend(audioCmdQueue, &c, 0);
 }
 // Отправляю команду полной остановки. Изменение состояния воспроизведения выполняется в аудиозадаче.
 static void stopEvent(lv_event_t*) {
@@ -991,18 +870,18 @@ static void sleepEvent(lv_event_t* e) {
 static volatile bool portalReturnRequested = false;
 // Запускаю отдельную задачу портала Radio-Setup на срок до пяти минут. После сохранения сети перезагружаю устройство; при таймауте прошу GUI вернуть главный экран.
 static void runWifiPortalTask(void*) {
-    LOG("WIFI", "portal task started");
+
     WiFiManager wm;
-    wm.setDebugOutput(RADIO_DIAGNOSTICS);
+    wm.setDebugOutput(false);
     wm.setConfigPortalTimeout(300);
     wm.setBreakAfterConfig(true);
     wm.setSaveConfigCallback([]() {
-        LOG("WIFI", "config saved, rebooting...");
+
         vTaskDelay(pdMS_TO_TICKS(1000));
         ESP.restart();
     });
     if (!wm.startConfigPortal("Radio-Setup")) {
-        LOGE("WIFI", "portal timeout");
+
         pushStatus("Таймаут настройки Wi-Fi");
         portalReturnRequested = true;
     }
@@ -1011,10 +890,10 @@ static void runWifiPortalTask(void*) {
 // После подтверждения показываю инструкцию подключения и создаю задачу Wi-Fi-портала. Блокирующая работа портала не выполняется внутри LVGL.
 static void startWifiConfirmed(lv_event_t*) {
     if (wifiConfirm) lv_obj_add_flag(wifiConfirm, LV_OBJ_FLAG_HIDDEN);
-    LOG("UI", "wifi setup requested");
+
     if (wifiScreen) lv_screen_load(wifiScreen);
     if (xTaskCreatePinnedToCore(runWifiPortalTask, "wifi_portal", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
-        LOGE("WIFI", "cannot create portal task");
+
     }
 }
 // Закрываю подтверждение, не запускаю настройку сети.
@@ -1025,6 +904,52 @@ static void cancelWifi(lv_event_t*) {
 static void wifiSetupEvent(lv_event_t*) {
     openLocalWifi();
 }
+// Schedule shortcuts: opaque pixel art inside generous touch targets.
+static lv_obj_t *alarmShortcut=nullptr, *offShortcut=nullptr;
+static void updateScheduleShortcuts(bool alarmOn,bool offOn) {
+    if(alarmShortcut) {
+        if(alarmOn) lv_obj_remove_flag(alarmShortcut,LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(alarmShortcut,LV_OBJ_FLAG_HIDDEN);
+    }
+    if(offShortcut) {
+        if(offOn) lv_obj_remove_flag(offShortcut,LV_OBJ_FLAG_HIDDEN);
+        else lv_obj_add_flag(offShortcut,LV_OBJ_FLAG_HIDDEN);
+    }
+}
+static lv_obj_t* makeScheduleShortcut(int x,bool alarm) {
+    lv_obj_t* button=lv_obj_create(mainScreen);
+    lv_obj_remove_style_all(button);
+    lv_obj_set_pos(button,x,0); lv_obj_set_size(button,40,38);
+    lv_obj_remove_flag(button,LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(button,LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_add_event_cb(button,[](lv_event_t* e){
+        lv_screen_load(lv_event_get_user_data(e)?alarmScreen:settingsScreen);
+    },LV_EVENT_CLICKED,alarm?reinterpret_cast<void*>(1):nullptr);
+    for(int iy=0;iy<20;iy++) for(int ix=0;ix<20;ix++) {
+        // Sample the original pixel art at 20 x 20; keep the touch target unchanged.
+        int px=ix*24/20,y=iy*24/20;
+        int dx=px-12,dy=y-12,d=dx*dx+dy*dy;
+        bool ink;
+        if(alarm) {
+            ink=(d>=64 && d<=100) || (px>=11 && px<=12 && y>=6 && y<=13)
+                || (y>=12 && y<=13 && px>=12 && px<=17)
+                || (y>=1 && y<=3 && ((px>=3 && px<=7)||(px>=17 && px<=21)))
+                || (y>=21 && y<=23 && ((px>=5 && px<=7)||(px>=17 && px<=19)));
+        } else {
+            ink=(d>=64 && d<=100 && !(y<10 && px>=8 && px<=16))
+                || (px>=11 && px<=13 && y>=1 && y<=12);
+        }
+        if(!ink) continue;
+        lv_obj_t* pixel=lv_obj_create(button); lv_obj_remove_style_all(pixel);
+        lv_obj_set_pos(pixel,10+ix,8+iy); lv_obj_set_size(pixel,1,1);
+        lv_obj_set_style_bg_color(pixel,lv_color_hex(0xffffff),0);
+        lv_obj_set_style_bg_opa(pixel,LV_OPA_COVER,0);
+        lv_obj_remove_flag(pixel,LV_OBJ_FLAG_CLICKABLE);
+        lv_obj_remove_flag(pixel,LV_OBJ_FLAG_SCROLLABLE);
+    }
+    lv_obj_add_flag(button,LV_OBJ_FLAG_HIDDEN);
+    return button;
+}
 /* ---------- Главный экран ---------- */
 // Один раз создаю главный экран, индикаторы, текущую станцию и область избранного. Координаты и цвета сохраняю; позже обновляю существующие объекты через refreshUi.
 static void buildMainScreen() {
@@ -1034,10 +959,8 @@ static void buildMainScreen() {
     lv_obj_set_style_border_width(mainScreen, 0, 0);
     lv_obj_set_style_bg_color(mainScreen, lv_color_hex(0x000000), 0);
     lv_obj_set_style_text_font(mainScreen, &dejavu_16, 0);
-    lv_obj_t* title = mustLabel(mainScreen, "title");
-    lv_label_set_text(title, "i - Радио");
-    lv_obj_set_style_text_color(title, lv_color_hex(0x4fc3f7), 0);
-    lv_obj_set_pos(title, 68, 8);
+    alarmShortcut=makeScheduleShortcut(66,true);
+    offShortcut=makeScheduleShortcut(108,false);
     lv_obj_remove_flag(mainScreen, LV_OBJ_FLAG_SCROLLABLE);
     // Graphic Wi-Fi icon: no font changes, 24 x 24 pixels.
     wifiIndicator = mustCreate(mainScreen, "wifiIndicator");
@@ -1128,7 +1051,6 @@ static void buildMainScreen() {
     lv_obj_set_style_text_color(batteryUnknown, lv_color_hex(0x808090), 0);
     lv_obj_center(batteryUnknown);
     updateBatteryIndicator();
-    lv_obj_set_pos(title, 68, 8);
     clockLabel = mustLabel(mainScreen,"clock");
     lv_obj_set_width(clockLabel, 52);
     lv_obj_set_style_text_align(clockLabel, LV_TEXT_ALIGN_CENTER, 0);
@@ -1298,11 +1220,11 @@ static void buildListScreen() {
     lv_obj_set_style_pad_row(list, 4, 0);
     lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_AUTO);
     for (int i = 0; i < ALL_STATIONS_COUNT; i++) {
-        LOG("BOOT", "station row %d/%d: %s", i + 1, ALL_STATIONS_COUNT, ALL_STATIONS[i].name);
+
         // Checkbox and playback button are siblings, not parent and child.
         lv_obj_t* row = lv_obj_create(list);
         if(!row) {
-            LOGE("UI", "list row OOM at %d", i);
+
             break;
         }
         lv_obj_remove_style_all(row);
@@ -1311,7 +1233,7 @@ static void buildListScreen() {
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_t* btn = lv_button_create(row);
         if (!btn) {
-            LOGE("UI", "list OOM at %d", i);
+
             break;
         }
         lv_obj_remove_style_all(btn);
@@ -1325,7 +1247,7 @@ static void buildListScreen() {
         lv_obj_add_event_cb(btn, allStationEvent, LV_EVENT_CLICKED, (void*)uintptr_t(i));
         lv_obj_t* lbl = lv_label_create(btn);
         if (!lbl) {
-            LOGE("UI", "list label OOM at %d", i);
+
             break;
         }
         lv_label_set_text(lbl, ALL_STATIONS[i].name);
@@ -1367,11 +1289,14 @@ static void hideAuthorEvent(lv_event_t* e) {
 #include "sd_player_ui.h"
 #include "photo_gallery.h"
 
+#include "alarm_ui.h"
+
 /* ---------- Настройки ---------- */
 // Создаю громкость, яркость, сон дисплея, таймер радио, настройку сети и окно автора. Ползунки связаны с отдельными обработчиками; построение экрана не запускает их действия вручную.
 static void buildSettingsScreen() {
     settingsScreen = lv_obj_create(NULL);
     if (!settingsScreen) fatal("settingsScreen alloc failed");
+    lv_obj_set_scroll_dir(settingsScreen, LV_DIR_VER);
     lv_obj_set_style_pad_all(settingsScreen, 0, 0);
     lv_obj_set_style_border_width(settingsScreen, 0, 0);
     lv_obj_set_style_bg_color(settingsScreen, lv_color_hex(0x000000), 0);
@@ -1458,7 +1383,8 @@ static void buildSettingsScreen() {
     lv_obj_set_ext_click_area(timerSlider, 10); // 32 px touch height, unchanged appearance
     lv_slider_set_range(timerSlider,0,4);
     lv_obj_add_event_cb(timerSlider,radioTimerEvent,LV_EVENT_VALUE_CHANGED,nullptr);
-    lv_obj_set_pos(wifiBtn, 16, 282);
+    buildOffControls();
+    lv_obj_set_pos(wifiBtn, 16, 382);
     lv_obj_set_size(wifiBtn, 208, 30);
     lv_obj_add_event_cb(wifiBtn, wifiSetupEvent, LV_EVENT_CLICKED, nullptr);
     lv_obj_t* wifiText = mustLabel(wifiBtn, "wifiSettingsText");
@@ -1696,7 +1622,7 @@ static void applyLinearVolume(Audio& audio, int selected) {
 
 // В этой задаче владею объектом Audio: обрабатываю команды, обслуживаю поток, сохраняю настройки и повторяю подключение. GUI общается с ней через очереди и общие значения, не обращаясь к Audio напрямую.
 void audio_task(void*) {
-    LOG("AUDIO", "task start (stack 20K)");
+
     // Не создаём аудиодрайвер и не открываем поток до исчезновения заставки.
     while (!startupScreenReady.load()) vTaskDelay(pdMS_TO_TICKS(10));
     Audio audio;
@@ -1712,9 +1638,8 @@ void audio_task(void*) {
     audio.forceMono(true);
     audio.setVolumeSteps(255);
     applyLinearVolume(audio, currentVolume.load());
-    LOG("I2S", "BCLK=%d LRCK=%d DOUT=%d MCLK=%d; PA_EN=%d (LOW=enabled); volume=%d/21", BCLK, LRCK, DOUT, MCLK, digitalRead(PA_EN), currentVolume.load());
+
     bool wasRunning = false;
-    uint32_t toneStarts = 0;
     // Test WAV uses Audio's own driver, never a second I2S driver.
     bool toneFsReady = false;
     // Формирую двухсекундный WAV: PCM, 48 кГц, два канала, 16 бит, тон 1 кГц. Воспроизвожу его только через существующий объект Audio.
@@ -1722,12 +1647,12 @@ void audio_task(void*) {
         if (!toneFsReady) {
             // Never format the user's flash if no filesystem is available.
             if (!LittleFS.begin(false)) {
-                LOGE("TONE", "LittleFS unavailable; test requires a filesystem partition");
+
                 return false;
             }
             File f = LittleFS.open("/radio_test.wav", "w");
             if (!f) {
-                LOGE("TONE FILE", "open for write failed");
+
                 return false;
             }
             const uint32_t bytes = 48000 * 2 * 2;
@@ -1778,24 +1703,20 @@ void audio_task(void*) {
                 && memcmp(header + 36, "data", 4) == 0;
             }
             if (verify) verify.close();
-            LOG("TONE FILE", "reopened header_ok=%d", int(headerOk));
-            LOG("TONE FILE", "created bytes=%u expected=192044; writes_ok=%d", unsigned(writtenSize), int(ok));
+
+
             if (!ok || !headerOk || writtenSize != 192044) return false;
             toneFsReady = true;
         }
         File check = LittleFS.open("/radio_test.wav", "r");
         if (!check) {
-            LOGE("TONE FILE", "open for read failed");
+
             return false;
         }
         size_t fileSize = check.size();
         check.close();
-        uint32_t started = millis();
         bool accepted = audio.connecttoFS(LittleFS, "/radio_test.wav");
-        ++toneStarts;
-        if (toneStarts == 1 || !accepted || toneStarts % 5 == 0)
-        LOG("TONE OPEN", "attempt=%lu bytes=%u accepted=%d elapsed=%lu ms (not proof of sound)",
-        (unsigned long)toneStarts, unsigned(fileSize), int(accepted), (unsigned long)(millis()-started));
+
         return accepted;
     };
     // Mount/scan the card before deciding between MP3 and radio restore.
@@ -1812,7 +1733,7 @@ void audio_task(void*) {
     auto saveSdPosition = [&]() {
         int index=sdCurrent.load();
         if(!sdActive.load() || index<0 || index>=int(sdMp3Files.size())) return;
-#if AUDIO_PROBE_V4
+#if AUDIO_RESUME_SECONDS
         // 4.x connecttoFS expects seconds, not a byte offset.
         String position=String("s")+String(audio.getAudioCurrentTime());
 #else
@@ -1849,11 +1770,13 @@ void audio_task(void*) {
         const int requested = currentVolume.load();
         applyLinearVolume(audio, requested);
         appliedVolume = requested;
-        LOG("VOLUME", "stream open: selected=%d/21 applied=%u/255", requested, unsigned(audio.getVolume()));
+
     };
     int persistedBright = currentBrightness.load(), observedBright = persistedBright;
     int persistedSleep = sleepChoice.load(), observedSleep = persistedSleep;
     uint32_t displayChangedAt = millis();
+    uint32_t savedAlarmConfig=alarmConfig.load(), savedOffConfig=offConfig.load();
+    uint32_t observedAlarmConfig=savedAlarmConfig, observedOffConfig=savedOffConfig, scheduleChangedAt=millis();
     // Повторные подключения начинаю с паузы 3 секунды и увеличиваю её до 30 секунд. wantPlayback отличает обрыв от намеренной остановки.
     uint32_t nextRetry=0;
     unsigned retryDelay=3000;
@@ -1867,12 +1790,6 @@ void audio_task(void*) {
     // Начинаю каждую попытку с чистого признака аудио. Старый блок предыдущей
     // станции не должен превратить новое соединение в «воспроизведение».
     auto openRadioStream = [&](const char* url) {
-        streamDiagTarget.store(url && strncmp(url, "https://mds-station.com:8443/", sizeof("https://mds-station.com:8443/") - 1) == 0);
-        diagPointersReady = false;
-        diagPreviousConnected = -1;
-        diagBytesRead = diagBytesWritten = 0;
-        diagLastReadAt = diagLastWriteAt = 0;
-        if (streamDiagTarget.load()) streamLog("DIAG", "target=mds HTTPS; baud=115200 timeout=4000ms snapshot=1000ms; mode is library-version-specific (4.x audio=3); pointer counters=input bytes, not network bytes; client.connected probe once per snapshot; HTTPS input_position counts library reads");
         stoppedByTimer = false;
         clearNowData();
         lastDecodedAudioAt.store(0);
@@ -1880,10 +1797,9 @@ void audio_task(void*) {
         streamOpenedAt = millis();
         wasRunning = false;
         isPlaying = false;
-        streamLog("OPEN", "station=%d url=%s retry_ms=%u", int(currentStation), url, retryDelay);
-        const uint32_t connectStarted = millis();
+
         bool accepted = audio.connecttohost(url);
-        streamLog("OPEN_RESULT", "accepted=%d elapsed_ms=%lu running=%d", int(accepted), (unsigned long)(millis()-connectStarted), int(audio.isRunning()));
+
         applyStreamVolume();
         if (!accepted) {
             streamOpenedAt = 0;
@@ -1921,6 +1837,12 @@ void audio_task(void*) {
         if (appliedVolume != desiredVolume) {
             applyLinearVolume(audio, desiredVolume);
             appliedVolume = desiredVolume;
+        }
+        uint32_t ac=alarmConfig.load(), oc=offConfig.load();
+        if(ac!=observedAlarmConfig || oc!=observedOffConfig) { observedAlarmConfig=ac; observedOffConfig=oc; scheduleChangedAt=millis(); }
+        if(millis()-scheduleChangedAt>1500) {
+            if(savedAlarmConfig!=observedAlarmConfig && radioPrefs.putUInt("alarmCfg",observedAlarmConfig)) { savedAlarmConfig=observedAlarmConfig; radioPrefs.putString("alarmUrl",ALL_STATIONS[(observedAlarmConfig>>11)&255].url); }
+            if(savedOffConfig!=observedOffConfig && radioPrefs.putUInt("offCfg",observedOffConfig)) savedOffConfig=observedOffConfig;
         }
         int bright = currentBrightness.load(), sleep = sleepChoice.load();
         if (bright != observedBright || sleep != observedSleep) {
@@ -1979,7 +1901,7 @@ void audio_task(void*) {
                     String position=sdBookmark.substring(0,a);
                     bool seconds=position.startsWith("s");
                     uint32_t pos=strtoul(position.c_str()+(seconds?1:0),nullptr,10);
-#if AUDIO_PROBE_V4
+#if AUDIO_RESUME_SECONDS
                     bool compatible=seconds && pos<=INT32_MAX;
 #else
                     bool compatible=!seconds && pos<size && pos<=INT32_MAX;
@@ -2029,7 +1951,7 @@ void audio_task(void*) {
                 audio.stopSong(); sdActive=false; sdPaused=false; sdEnded=false;
                 stoppedByTimer=true;
             }
-            LOG("AUDIO CMD", "received type=%d value=%u queued=%u", int(c.type), c.value, unsigned(uxQueueMessagesWaiting(audioCmdQueue)));
+
             if (c.type == CMD_SET_VOLUME) {
                 /* Legacy command: the atomic mailbox is authoritative. */
             }
@@ -2070,7 +1992,7 @@ void audio_task(void*) {
                 audio.stopSong();
                 isPlaying = false;
                 currentStation = -1;
-                LOG("TONE CMD", "toggle previous=%d next=%d", int(testToneActive), int(!testToneActive));
+
                 testToneActive = !testToneActive;
                 wasRunning = false;
                 bool testFailed = false;
@@ -2079,7 +2001,7 @@ void audio_task(void*) {
                     testToneActive = false;
                     pushStatus("Ошибка запуска теста");
                 }
-                LOG("TONE", "test=%s; 1000 Hz / 48000 Hz / stereo 16-bit; volume=%d/21", testToneActive ? "ON" : "OFF", currentVolume.load());
+
                 if (!testFailed) pushStatus(testToneActive ? "Тестовый тон 1000 Гц" : "Тестовый тон выключен");
             }
             else if (c.type == CMD_STOP) {
@@ -2103,7 +2025,7 @@ void audio_task(void*) {
                 if (c.type == CMD_PLAY_ALL) {
                     i = c.value;
                     if (i >= ALL_STATIONS_COUNT) {
-                        LOGE("AUDIO", "bad idx %d", i);
+
                         continue;
                     }
                     url = ALL_STATIONS[i].url;
@@ -2126,7 +2048,7 @@ void audio_task(void*) {
                 if (!url || !*url) pushStatus("Нет URL");
                 else if (WiFi.status() != WL_CONNECTED) pushStatus("Нет Wi-Fi");
                 else {
-                    LOG("CONNECT", "%s | %s", name, url);
+
                     pushStatus("Подключение...");
                     // NVS может блокировать выполнение и доступ к flash.
                     // Сохраняю выбор только при остановленном старом потоке,
@@ -2155,10 +2077,8 @@ void audio_task(void*) {
         }
         uint32_t audioReference = decodedAt ? decodedAt : streamOpenedAt;
         if (wantPlayback && streamOpenedAt && millis() - audioReference >= (streamHadAudio ? AUDIO_STALL_MS : AUDIO_WAIT_MS)) {
-            streamLog("STOP_TIMEOUT", "had_audio=%d gap_ms=%lu filled=%lu free=%lu running=%d wifi=%d", int(streamHadAudio), (unsigned long)(millis()-audioReference), (unsigned long)audio.inBufferFilled(), (unsigned long)audio.inBufferFree(), int(audio.isRunning()), int(WiFi.status()));
-            logAudioInternal(audio);
+
             audio.stopSong();
-            diagPointersReady = false;
             isPlaying = false;
             streamOpenedAt = 0;
             lastDecodedAudioAt.store(0);
@@ -2175,16 +2095,7 @@ void audio_task(void*) {
         }
         spectrumSampleRate.store(audio.getSampleRate());
         spectrumChannels.store(audio.getChannels());
-        static uint32_t diagPrevLoopAt = 0, diagMaxGapUs = 0, diagMaxLoopUs = 0, diagLoops = 0;
-        const uint32_t diagLoopStart = micros();
-        if (diagPrevLoopAt) diagMaxGapUs = max(diagMaxGapUs, uint32_t(diagLoopStart - diagPrevLoopAt));
-        diagPrevLoopAt = diagLoopStart;
-        if (audio.isRunning()) sampleAudioBuffer(audio);
-        installTLSReceiveProbe(audio);
         audio.loop();
-        if (audio.isRunning()) sampleAudioBuffer(audio);
-        diagMaxLoopUs = max(diagMaxLoopUs, uint32_t(micros() - diagLoopStart));
-        ++diagLoops;
         // Не обращаемся к Audio из GUI и не меняем обслуживание потока.
         static uint32_t lastBufferSample = 0;
         const uint32_t bufferSampleAt = millis();
@@ -2194,24 +2105,6 @@ void audio_task(void*) {
             const uint32_t free = audio.inBufferFree();
             const uint32_t total = filled + free;
             inputBufferPermille.store(total ? uint16_t(uint64_t(filled) * 1000 / total) : 0);
-        }
-        static uint32_t diagLastReport = 0;
-        if (STREAM_COM_DIAGNOSTICS && bufferSampleAt - diagLastReport >= 1000) {
-            diagLastReport = bufferSampleAt;
-            if (streamDiagTarget.load()) {
-            const uint32_t lastBlock = lastDecodedAudioAt.load();
-            logAudioInternal(audio);
-            streamLog("FLOW", "station=%d want=%d running=%d had_audio=%d buf=%lu free=%lu pcm_age_ms=%ld loops=%lu loop_max_us=%lu gap_max_us=%lu wifi=%d rssi=%d heap=%lu psram=%lu codec=%s rate=%lu bitrate=%lu dropped=%lu",
-                int(currentStation), int(wantPlayback.load()), int(audio.isRunning()), int(streamHadAudio),
-                (unsigned long)audio.inBufferFilled(), (unsigned long)audio.inBufferFree(),
-                lastBlock ? long(bufferSampleAt-lastBlock) : -1L, (unsigned long)diagLoops,
-                (unsigned long)diagMaxLoopUs, (unsigned long)diagMaxGapUs,
-                int(WiFi.status()), int(WiFi.RSSI()), (unsigned long)ESP.getFreeHeap(),
-                (unsigned long)ESP.getFreePsram(), audio.getCodecname(),
-                (unsigned long)audio.getSampleRate(), (unsigned long)audio.getBitRate(),
-                (unsigned long)streamLogDropped.load());
-            }
-            diagLoops = diagMaxLoopUs = diagMaxGapUs = 0;
         }
         if(sdActive.load()) {
             sdElapsed=audio.getAudioCurrentTime(); sdDuration=audio.getAudioFileDuration();
@@ -2276,8 +2169,8 @@ static void showStartupLogo();
 /* ---------- GUI task ---------- */
 // В этой задаче создаю LVGL и все экраны, опрашиваю касания и обслуживаю графику. Буферы рисования размещаю в PSRAM, а блок передачи — в памяти, доступной DMA.
 void gui_task(void*) {
-    LOG("GUI", "task start");
-    LOG("BOOT", "GUI task: before lv_init; compiled LV_MEM_SIZE=%u", (unsigned)LV_MEM_SIZE);
+
+
     lv_init();
     // Register extra PSRAM explicitly: build-time LV_MEM_SIZE overrides
     // must not leave the 98-row interface with only the original 192 KiB.
@@ -2288,7 +2181,7 @@ void gui_task(void*) {
     if (!extraUiPool) fatal("LVGL extra PSRAM allocation failed");
     if (!lv_mem_add_pool(extraUiPool, extraUiPoolBytes))
     fatal("LVGL extra PSRAM pool registration failed");
-    LOG("BOOT", "LVGL extra PSRAM pool registered: %u bytes", (unsigned)extraUiPoolBytes);
+
     // Два буфера по 20 строк позволяют рисовать частями. Отдельный внутренний блок из 8 строк нужен для безопасной передачи через DMA.
     constexpr int bufPixels = 240 * 20;
     lv_color_t* buf1 = (lv_color_t*)heap_caps_malloc(bufPixels * sizeof(lv_color_t), MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
@@ -2308,27 +2201,28 @@ void gui_task(void*) {
     lv_indev_set_display(indev, disp);
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, touchRead);
-    LOG("BOOT", "building Main screen");
+
     buildMainScreen();
-    LOG("BOOT", "building List screen");
+
     buildListScreen();
-    LOG("BOOT", "building Settings screen");
+
     buildSettingsScreen();
+    buildAlarmScreen();
     buildDebugScreen();
     buildGalleryScreen();
-    LOG("BOOT", "building Wifi screen");
+
     buildWifiScreen();
     buildLocalWifiScreen();
     buildVolumePopup();
     // Экраны уже готовы: после заставки сразу рисуем интерфейс.
     showStartupLogo();
-    LOG("BOOT", "loading main screen");
+
     lv_screen_load(mainScreen);
     refreshUi();
     lv_refr_now(disp);
     gfx.waitDMA();
     startupScreenReady.store(true);
-    LOG("GUI", "entering loop");
+
     lastTouchAt = millis();
     uint32_t last = millis(), lastWifiCheck = 0, lastUiRefresh = 0;
     for (;;) {
@@ -2397,6 +2291,7 @@ void gui_task(void*) {
             time_t t=time(nullptr);
             struct tm local;
             localtime_r(&t,&local);
+            checkSchedules(t,local);
             char b[64];
             uint32_t d=radioDeadline.load();
             if(t>1700000000) snprintf(b,sizeof(b),"%02d:%02d",local.tm_hour,local.tm_min);
@@ -2438,34 +2333,26 @@ void gui_task(void*) {
     }
 }
 /* ---------- Колбэки метаданных ---------- */
-// Получаю уведомление об окончании файла. В этой версии обработчик оставляет только отключённый диагностический вызов.
+// Получаю уведомление об окончании файла для перехода к следующему треку.
 void audio_eof_mp3(const char* info) {
     if(sdActive.load()) sdEnded.store(true);
-    streamLog("AUDIO EOF", "file ended: %s", info ? info : "");
-}
-// Получаю уведомление об окончании потока. Логику повторных попыток оставляю в аудиозадаче.
-void audio_eof_stream(const char* info) {
-    streamLog("AUDIO EOF", "stream ended: %s", info ? info : "");
-}
-// Принимаю информационное сообщение библиотеки. Общая диагностика отключена макросом LOG.
-void audio_info(const char* info) {
-    if(info) streamLog("LIB", "%s", info);
+
 }
 // Передаю полученное от сервера название станции в очередь метаданных.
 void audio_showstation(const char* info) {
-    streamLog("META", "audio_showstation: %s", info ? info : "");
+
     storeNowText(nowBroadcast, sizeof(nowBroadcast), info);
 }
 void audio_showstreamtitle(const char* info) {
-    streamLog("META", "audio_showstreamtitle: %s", info ? info : "");
+
     storeNowText(nowTrack, sizeof(nowTrack), info);
 }
 void audio_icydescription(const char* info) {
-    streamLog("META", "audio_icydescription: %s", info ? info : "");
+
     storeNowText(nowDescription, sizeof(nowDescription), info);
 }
 void audio_icyurl(const char* info) {
-    streamLog("META", "audio_icyurl: %s", info ? info : "");
+
     storeNowText(nowWebsite, sizeof(nowWebsite), info);
 }
 // Пиксельная заставка: перспективное кольцо, без изменения шрифта GUI.
@@ -2541,9 +2428,6 @@ static void showStartupLogo() {
 /* ---------- Setup ---------- */
 // Выполняю однократный запуск: оборудование, очереди, сохранённые настройки и сеть, затем создаю аудиозадачу на ядре 0 и GUI на ядре 1. Заставка выполняется в GUI после создания экранов, без ожидания сети.
 void setup() {
-    // Temporary gallery timing only; general logging stays disabled.
-    Serial.begin(115200);
-    Serial.setDebugOutput(false);
     pinMode(9, INPUT);
     analogSetPinAttenuation(9, ADC_11db);
     pinMode(PA_EN, OUTPUT);
@@ -2572,7 +2456,7 @@ void setup() {
     Wire.setClock(400000);
     wireDiagMutex = xSemaphoreCreateMutex();
     if (!wireDiagMutex) fatal("I2C diagnostic mutex failed");
-    LOG("BOOT", "initializing ES8311");
+
     if (!es8311_init()) fatal("ES8311 init failed");
     // Восстанавливаю станции по URL; старый формат сбрасываю один раз.
     for (int i = 0; i < FAVORITES_COUNT; ++i) favoriteIds[i] = -1;
@@ -2584,6 +2468,14 @@ void setup() {
         currentVolume = constrain(int(radioPrefs.getUChar("volume", 6)), 0, 21);
         currentBrightness = constrain(int(radioPrefs.getUChar("brightness", 100)), 15, 100);
         sleepChoice = constrain(int(radioPrefs.getUChar("sleep", 0)), 0, 6);
+        uint32_t ac=radioPrefs.getUInt("alarmCfg",360), oc=radioPrefs.getUInt("offCfg",1320);
+        if((ac&2047)>=1440) ac=360;
+        String alarmUrl=radioPrefs.getString("alarmUrl", "");
+        int station=-1;
+        for(int i=0;i<ALL_STATIONS_COUNT;i++) if(alarmUrl==ALL_STATIONS[i].url) {station=i; break;}
+        if(station<0) { for(int i=0;i<ALL_STATIONS_COUNT;i++) if(!strcmp(ALL_STATIONS[i].name,"Маяк")) station=i; }
+        ac=(ac & ~(255UL<<11)) | (uint32_t(max(0,station))<<11);
+        alarmConfig=ac; offConfig=(oc&2047)<1440?oc:1320;
         const bool resetStations = radioPrefs.getInt("stationFmt", 0) != STATION_STORAGE_VERSION;
         if (resetStations) {
             // Однократный сброс только станций. Wi-Fi и остальные настройки не трогаю.
@@ -2625,10 +2517,10 @@ void setup() {
                 break;
             }
         }
-    } else LOGE("SETTINGS", "cannot open saved settings");
+    }
     setBrightness(currentBrightness.load());
     // GUI запускается до блокирующего подключения Wi-Fi.
-    LOG("BOOT", "creating GUI task");
+
     if (xTaskCreatePinnedToCore(gui_task, "gui", 12288, nullptr, 5, nullptr, 1) != pdPASS) fatal("gui task");
     /* ---- WiFi: подключаемся к сохранённой сети, портал НЕ запускаем ---- */
     WiFi.mode(WIFI_STA);
@@ -2637,21 +2529,21 @@ void setup() {
     // Moscow time
     WiFi.persistent(true);
     WiFiManager wm;
-    wm.setDebugOutput(RADIO_DIAGNOSTICS);
+    wm.setDebugOutput(false);
     wm.setEnableConfigPortal(false);
     // портал только по кнопке
     wm.setConnectTimeout(30);
     // 30 секунд на попытку
     if (wm.autoConnect()) {
-        LOG("WIFI", "connected to saved network, IP=%s", WiFi.localIP().toString().c_str());
+
     } else {
-        LOG("WIFI", "no saved network, use button 'Настройка Wi-Fi'");
+
     }
-    LOG("BOOT", "creating audio task");
+
     // Разделяю звук и графику по ядрам, сохраняя проверенные размеры стеков и приоритеты. Эти размеры — рабочий стек задач, не сетевой буфер.
     if (xTaskCreatePinnedToCore(audio_task, "audio", 20480, nullptr, 2, nullptr, 0) != pdPASS) fatal("audio task");
     startWebRemote();
-    LOG("BOOT", "setup done");
+
 }
 // Основная работа уже выполняется отдельными задачами. Здесь только освобождаю процессор задержкой, без дополнительного обслуживания Audio или LVGL.
 void loop() {
