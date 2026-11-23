@@ -36,6 +36,7 @@
 #include <time.h>
 #include <string.h>
 #include "stations.h"
+#include "station_catalog.h"
 
 // Explicit prototype prevents Arduino from inserting it before RadioStation is known.
 static const RadioStation* selectedStation(int n);
@@ -274,11 +275,22 @@ static lv_obj_t* settingsScreen = nullptr;
 static lv_obj_t* debugScreen = nullptr;
 static lv_obj_t* galleryScreen = nullptr;
 static bool photoViewing=false;
+static int pendingPhotoSwipe=0; // 1 next, -1 previous, 2 list
 static lv_obj_t* pendingScreenSwipe = nullptr;
+static bool swipeMovesLeft = true;
+static uint32_t screenSlideUntil = 0;
+// Animate resident screens without snapshots or deleting their controls.
+static void slideToScreen(lv_obj_t* screen, bool movesLeft) {
+    if (!screen || screen == lv_screen_active()) return;
+    screenSlideUntil = millis() + 130;
+    lv_screen_load_anim(screen, movesLeft ? LV_SCREEN_LOAD_ANIM_MOVE_LEFT : LV_SCREEN_LOAD_ANIM_MOVE_RIGHT,
+                        90, 0, false);
+}
 static lv_obj_t* alarmScreen = nullptr;
 static bool scheduleTimePopupOpen = false;
 static lv_obj_t* remoteAddressLabel = nullptr;
 static lv_obj_t* wifiScreen = nullptr;
+static lv_obj_t *localWifiScreen = nullptr, *localWifiEditor = nullptr;
 static lv_obj_t* volumeSlider = nullptr;
 static lv_obj_t* volumeLabel = nullptr;
 static lv_obj_t* globalVolumeButton=nullptr;
@@ -365,7 +377,7 @@ static lv_obj_t* clockLabel = nullptr;
 static lv_obj_t* radioCountdownLabel = nullptr;
 static lv_obj_t* timerLabel = nullptr;
 static lv_obj_t* radioTimerSlider = nullptr;
-static lv_obj_t* favoriteChecks[ALL_STATIONS_COUNT]{
+static lv_obj_t* favoriteChecks[MAX_STATIONS]{
 };
 static const int radioMinutes[] = {
     0,15,30,60,90
@@ -422,7 +434,7 @@ static lv_obj_t* nowTile = nullptr;
 static lv_obj_t* nowLabel = nullptr;
 static lv_obj_t* nowIcon = nullptr;
 static lv_obj_t* favIcons[STATION_COUNT];
-static lv_obj_t* listIcons[ALL_STATIONS_COUNT];
+static lv_obj_t* listIcons[MAX_STATIONS];
 static lv_obj_t* wifiConfirm = nullptr;
 // Преобразую внутренний номер в запись станции: 0–19 обозначают места избранного, 100 + индекс — общий список. Для пустого или неизвестного номера возвращаю nullptr.
 static const RadioStation* selectedStation(int n) {
@@ -560,6 +572,13 @@ static void flush(lv_display_t* d, const lv_area_t* a, uint8_t* px_map) {
 }
 // Передаю касание LVGL и сбрасываю счётчик бездействия. Первое касание спящего дисплея только включает подсветку; до отпускания пальца подавляю его, чтобы случайно не нажать кнопку.
 static void touchRead(lv_indev_t*, lv_indev_data_t* data) {
+    // Replay a short tap as press/release only after ruling out navigation.
+    static bool tapReleasePending = false;
+    if (tapReleasePending) {
+        tapReleasePending = false;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     int16_t x, y;
     bool p = readTouch(x, y);
     if (p) {
@@ -575,20 +594,62 @@ static void touchRead(lv_indev_t*, lv_indev_data_t* data) {
         if (!p) suppressWakeTouch = false;
         return;
     }
+    // Ignore touches during the short transition; require release afterwards.
+    if (screenSlideUntil && (int32_t)(millis() - screenSlideUntil) < 0) {
+        suppressWakeTouch = p;
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
+    }
     // Classify horizontal motion before release so a swipe cannot click a tile.
     static bool tracking = false, horizontal = false, blockNavigation = false;
     static int startX = 0, startY = 0;
     static lv_obj_t* startScreen = nullptr;
+    static bool arbitrate = false, controlTouch = false;
+    static uint32_t touchStartedAt = 0;
+    static int maxTouchTravel = 0;
+    static bool photoTouch = false;
+    static int photoDx = 0, photoDy = 0;
     if (p && !tracking) {
         tracking = true; horizontal = false;
-        blockNavigation = scheduleTimePopupOpen || photoViewing || sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
+        photoTouch = photoViewing && lv_screen_active() == galleryScreen && !volumePopupOpen;
+        photoDx = photoDy = 0;
+        blockNavigation = (lv_screen_active() == localWifiScreen && localWifiEditor && !lv_obj_has_flag(localWifiEditor, LV_OBJ_FLAG_HIDDEN) && y >= 88) || scheduleTimePopupOpen || photoViewing || sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
         startX = x; startY = y; startScreen = lv_screen_active();
+        arbitrate = !blockNavigation && (startScreen == settingsScreen || startScreen == debugScreen || startScreen == localWifiScreen);
+        controlTouch = false;
+        touchStartedAt = millis();
+        maxTouchTravel = 0;
+    }
+    if (p && tracking) maxTouchTravel = max(maxTouchTravel, max(abs(x - startX), abs(y - startY)));
+    // Defer photo taps until release: a swipe must not reveal/click controls.
+    // Queue actions for the GUI loop, never decode or change objects here.
+    if (tracking && photoTouch) {
+        if (p) {
+            photoDx = x - startX; photoDy = y - startY;
+            data->state = LV_INDEV_STATE_RELEASED;
+            return;
+        }
+        tracking = false; photoTouch = false;
+        if (abs(photoDy) >= 45 && abs(photoDy) > abs(photoDx) * 2)
+            pendingPhotoSwipe = photoDy < 0 ? 1 : -1;
+        else if (photoDx >= 45 && abs(photoDx) > abs(photoDy) * 2)
+            pendingPhotoSwipe = 2;
+        else if (maxTouchTravel < 12) {
+            data->point.x = startX; data->point.y = startY;
+            data->state = LV_INDEV_STATE_PRESSED;
+            data->continue_reading = true;
+            tapReleasePending = true;
+            return;
+        }
+        data->state = LV_INDEV_STATE_RELEASED;
+        return;
     }
     if (p && volumePopupOpen) volumePopupActivity = millis();
-    if (p && tracking && !blockNavigation && !volumePopupOpen && (startScreen == mainScreen || startScreen == settingsScreen || startScreen == alarmScreen || startScreen == debugScreen || startScreen == galleryScreen)) {
+    if (p && tracking && !controlTouch && !blockNavigation && !volumePopupOpen && (startScreen == mainScreen || startScreen == settingsScreen || startScreen == alarmScreen || startScreen == debugScreen || startScreen == galleryScreen || startScreen == localWifiScreen)) {
         int dx = x - startX, dy = y - startY;
         if (!horizontal && abs(dx) >= 45 && abs(dx) > abs(dy) * 2) {
             horizontal = true;
+            swipeMovesLeft = dx < 0;
             lv_indev_wait_release(lv_indev_active());
             if (startScreen == mainScreen && dx < 0) pendingPlayingSwipe = 1;
             if (startScreen == mainScreen && dx > 0) pendingScreenSwipe = alarmScreen;
@@ -596,9 +657,35 @@ static void touchRead(lv_indev_t*, lv_indev_data_t* data) {
             if (startScreen == debugScreen && dx < 0) pendingScreenSwipe = galleryScreen;
             if (startScreen == alarmScreen && dx < 0) pendingScreenSwipe = mainScreen;
             if (startScreen == alarmScreen && dx > 0) pendingScreenSwipe = settingsScreen;
+            if (startScreen == localWifiScreen && dx < 0) pendingScreenSwipe = settingsScreen;
             if (startScreen == settingsScreen && dx < 0) pendingScreenSwipe = alarmScreen;
             if (startScreen == settingsScreen && dx > 0) pendingLocalWifiSwipe = true;
             if (startScreen == galleryScreen && dx > 0) pendingScreenSwipe = debugScreen;
+        }
+    }
+    if (arbitrate && tracking && !horizontal && !controlTouch) {
+        if (p) {
+            const int dx = x - startX, dy = y - startY;
+            // Vertical scrolling stays available. A stationary hold grants the
+            // control exclusive ownership, so dragging it cannot change screens.
+            if ((abs(dy) >= 12 && abs(dy) > abs(dx)) ||
+                (millis() - touchStartedAt >= 180 && abs(dx) < 12 && abs(dy) < 12)) {
+                controlTouch = true;
+            } else {
+                data->state = LV_INDEV_STATE_RELEASED;
+                return;
+            }
+        } else {
+            tracking = false;
+            // A moving gesture that did not reach a neighbouring screen is not a tap.
+            if (maxTouchTravel < 12) {
+                data->point.x = startX;
+                data->point.y = startY;
+                data->state = LV_INDEV_STATE_PRESSED;
+                data->continue_reading = true;
+                tapReleasePending = true;
+                return;
+            }
         }
     }
     if (!p) { tracking = false; horizontal = false; }
@@ -814,9 +901,10 @@ static void buildVolumePopup() {
     // Opaque square pixels, no glyphs or antialiasing.
     lv_obj_t* button = mustButton(top, "globalVolume");
     globalVolumeButton=button;
+    lv_obj_remove_style_all(button);
     lv_obj_set_pos(button, 204, 2); lv_obj_set_size(button, 34, 34);
     lv_obj_set_style_pad_all(button, 0, 0);
-    lv_obj_set_style_bg_color(button, lv_color_hex(0x18221b), 0);
+    lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_remove_flag(button, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(button, openVolumePopup, LV_EVENT_CLICKED, nullptr);
     const int pixels[][4] = {{6,13,4,8},{10,11,2,12},{12,9,2,16},{14,7,2,20},{20,11,2,12},{24,8,2,18}};
@@ -824,7 +912,7 @@ static void buildVolumePopup() {
         lv_obj_t* pixel = mustCreate(button, "speakerPixel");
         lv_obj_remove_style_all(pixel);
         lv_obj_set_pos(pixel,r[0],r[1]); lv_obj_set_size(pixel,r[2],r[3]);
-        lv_obj_set_style_bg_color(pixel,lv_color_hex(0x80ff80),0);
+        lv_obj_set_style_bg_color(pixel,lv_color_hex(0xffffff),0);
         lv_obj_set_style_bg_opa(pixel,LV_OPA_COVER,0);
         lv_obj_remove_flag(pixel,static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_CLICKABLE|LV_OBJ_FLAG_SCROLLABLE));
     }
@@ -878,6 +966,7 @@ static void runWifiPortalTask(void*) {
     wm.setSaveConfigCallback([]() {
 
         vTaskDelay(pdMS_TO_TICKS(1000));
+        if (WiFi.status() == WL_CONNECTED) wifiSavedRemember(WiFi.SSID(), WiFi.psk());
         ESP.restart();
     });
     if (!wm.startConfigPortal("Radio-Setup")) {
@@ -885,15 +974,23 @@ static void runWifiPortalTask(void*) {
         pushStatus("Таймаут настройки Wi-Fi");
         portalReturnRequested = true;
     }
+    wifiPortalBusy.store(false);
     vTaskDelete(NULL);
 }
 // После подтверждения показываю инструкцию подключения и создаю задачу Wi-Fi-портала. Блокирующая работа портала не выполняется внутри LVGL.
 static void startWifiConfirmed(lv_event_t*) {
+    if (localWifiBusy.load()) {
+        lv_label_set_text(localWifiStatus, "Дождитесь завершения поиска");
+        return;
+    }
+    if (wifiPortalBusy.exchange(true)) return;
     if (wifiConfirm) lv_obj_add_flag(wifiConfirm, LV_OBJ_FLAG_HIDDEN);
 
     if (wifiScreen) lv_screen_load(wifiScreen);
     if (xTaskCreatePinnedToCore(runWifiPortalTask, "wifi_portal", 8192, nullptr, 1, nullptr, 0) != pdPASS) {
-
+        wifiPortalBusy.store(false);
+        lv_screen_load(localWifiScreen);
+        lv_label_set_text(localWifiStatus, "Не удалось открыть портал");
     }
 }
 // Закрываю подтверждение, не запускаю настройку сети.
@@ -902,7 +999,8 @@ static void cancelWifi(lv_event_t*) {
 }
 // Показываю предупреждение перед открытием портала настройки сети.
 static void wifiSetupEvent(lv_event_t*) {
-    openLocalWifi();
+    lv_obj_remove_flag(wifiConfirm, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_move_foreground(wifiConfirm);
 }
 // Schedule shortcuts: opaque pixel art inside generous touch targets.
 static lv_obj_t *alarmShortcut=nullptr, *offShortcut=nullptr;
@@ -925,6 +1023,11 @@ static lv_obj_t* makeScheduleShortcut(int x,bool alarm) {
     lv_obj_add_event_cb(button,[](lv_event_t* e){
         lv_screen_load(lv_event_get_user_data(e)?alarmScreen:settingsScreen);
     },LV_EVENT_CLICKED,alarm?reinterpret_cast<void*>(1):nullptr);
+    // Two permanent masks/descriptors: no allocation and no growing descriptor counter.
+    static uint8_t masks[2][400] = {};
+    static lv_image_dsc_t descriptors[2] = {};
+    const int slot = alarm ? 0 : 1;
+    uint8_t* mask = masks[slot];
     for(int iy=0;iy<20;iy++) for(int ix=0;ix<20;ix++) {
         // Sample the original pixel art at 20 x 20; keep the touch target unchanged.
         int px=ix*24/20,y=iy*24/20;
@@ -939,14 +1042,19 @@ static lv_obj_t* makeScheduleShortcut(int x,bool alarm) {
             ink=(d>=64 && d<=100 && !(y<10 && px>=8 && px<=16))
                 || (px>=11 && px<=13 && y>=1 && y<=12);
         }
-        if(!ink) continue;
-        lv_obj_t* pixel=lv_obj_create(button); lv_obj_remove_style_all(pixel);
-        lv_obj_set_pos(pixel,10+ix,8+iy); lv_obj_set_size(pixel,1,1);
-        lv_obj_set_style_bg_color(pixel,lv_color_hex(0xffffff),0);
-        lv_obj_set_style_bg_opa(pixel,LV_OPA_COVER,0);
-        lv_obj_remove_flag(pixel,LV_OBJ_FLAG_CLICKABLE);
-        lv_obj_remove_flag(pixel,LV_OBJ_FLAG_SCROLLABLE);
+        mask[iy*20+ix] = ink ? 255 : 0;
     }
+    lv_image_dsc_t& d = descriptors[slot];
+    d.header.magic = LV_IMAGE_HEADER_MAGIC;
+    d.header.cf = LV_COLOR_FORMAT_A8;
+    d.header.w = 20; d.header.h = 20; d.header.stride = 20;
+    d.data_size = 400; d.data = mask;
+    lv_obj_t* image = lv_image_create(button);
+    lv_image_set_src(image, &d);
+    lv_obj_set_pos(image, 10, 8);
+    lv_obj_set_style_image_recolor(image, lv_color_white(), 0);
+    lv_obj_set_style_image_recolor_opa(image, LV_OPA_COVER, 0);
+    lv_obj_remove_flag(image, LV_OBJ_FLAG_CLICKABLE);
     lv_obj_add_flag(button,LV_OBJ_FLAG_HIDDEN);
     return button;
 }
@@ -1131,40 +1239,6 @@ static void buildMainScreen() {
     lv_label_set_text(allLbl, "Станции");
     lv_obj_center(allLbl);
     lv_obj_set_style_text_color(allLbl, lv_color_hex(0x9090a0), 0);
-    lv_obj_t* wifiBtn = mustButton(mainScreen, "wifiBtn");
-    lv_obj_set_pos(wifiBtn, 204, 2);
-    lv_obj_set_size(wifiBtn, 32, 32);
-    lv_obj_set_ext_click_area(wifiBtn, 4);
-    lv_obj_set_style_pad_all(wifiBtn, 0, 0);
-    lv_obj_set_style_bg_color(wifiBtn, lv_color_hex(0x000000), 0);
-    lv_obj_set_style_radius(wifiBtn, 0, 0);
-    lv_obj_set_style_bg_opa(wifiBtn, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(wifiBtn, 0, 0);
-    lv_obj_add_event_cb(wifiBtn, openSettingsEvent, LV_EVENT_CLICKED, nullptr);
-    // Draw a gear, independent of font glyph coverage.
-    for (int i = 0; i < 8; ++i) {
-        lv_obj_t* tooth = lv_line_create(wifiBtn);
-        static lv_point_precise_t teeth[8][2];
-        float angle = i * 3.14159265f / 4;
-        teeth[i][0] = {
-            float(16 + 8*cosf(angle)), float(16 + 8*sinf(angle))
-        };
-        teeth[i][1] = {
-            float(16 + 12*cosf(angle)), float(16 + 12*sinf(angle))
-        };
-        lv_line_set_points(tooth, teeth[i], 2);
-        lv_obj_set_style_line_width(tooth, 4, 0);
-        lv_obj_set_style_line_color(tooth, lv_color_hex(0xE0E0E0), 0);
-        lv_obj_clear_flag(tooth, LV_OBJ_FLAG_CLICKABLE);
-    }
-    lv_obj_t* ring = lv_obj_create(wifiBtn);
-    lv_obj_remove_style_all(ring);
-    lv_obj_set_pos(ring, 7, 7);
-    lv_obj_set_size(ring, 18, 18);
-    lv_obj_set_style_radius(ring, LV_RADIUS_CIRCLE, 0);
-    lv_obj_set_style_border_width(ring, 4, 0);
-    lv_obj_set_style_border_color(ring, lv_color_hex(0xE0E0E0), 0);
-    lv_obj_clear_flag(ring, LV_OBJ_FLAG_CLICKABLE);
     statusLabel = mustLabel(mainScreen, "statusLabel");
     lv_label_set_text(statusLabel, currentStatus);
     lv_obj_set_style_text_color(statusLabel, lv_color_hex(0x8080a0), 0);
@@ -1811,7 +1885,16 @@ void audio_task(void*) {
         nextRetry = millis() + retryDelay;
         return accepted;
     };
+    // Локальный кэш только для аудиозадачи: не опрашиваем Wi-Fi
+    // на каждом проходе. Первый замер выполняется сразу при старте цикла.
+    bool audioWifiConnected = (WiFi.status() == WL_CONNECTED);
+    uint32_t audioWifiCheckedAt = millis();
     for (;;) {
+        const uint32_t wifiCheckNow = millis();
+        if (uint32_t(wifiCheckNow - audioWifiCheckedAt) >= 100U) {
+            audioWifiCheckedAt = wifiCheckNow;
+            audioWifiConnected = (WiFi.status() == WL_CONNECTED);
+        }
         // Записываю избранное вне GUI; прочие настройки сохраняю после секунды без изменений, а не на каждом движении ползунка.
         if(favoritesDirty.exchange(false)) for(int j=0;j<FAVORITES_COUNT;j++) {
             char key[8];
@@ -1861,7 +1944,7 @@ void audio_task(void*) {
         if (persistedVolume != observedVolume && millis() - volumeChangedAt > 1000) {
             if (radioPrefs.putUChar("volume", observedVolume)) persistedVolume = observedVolume;
         }
-        if (restorePending && WiFi.status() == WL_CONNECTED) {
+        if (restorePending && audioWifiConnected) {
             restorePending = false;
             sendCommand({
                 savedStation >= 100 ? CMD_PLAY_ALL : CommandType(CMD_PLAY_FAV_0 + savedStation), uint8_t(savedStation >= 100 ? savedStation-100 : 0)
@@ -1970,7 +2053,7 @@ void audio_task(void*) {
                         recoveryAllowed = false;
                         retryDelay = 3000;
                         nextRetry = millis() + retryDelay;
-                        if (WiFi.status() == WL_CONNECTED) {
+                        if (audioWifiConnected) {
                             pushStatus("Подключение...");
                             openRadioStream(station->url);
                         } else {
@@ -2046,7 +2129,7 @@ void audio_task(void*) {
                 audio.stopSong();
                 isPlaying = false;
                 if (!url || !*url) pushStatus("Нет URL");
-                else if (WiFi.status() != WL_CONNECTED) pushStatus("Нет Wi-Fi");
+                else if (!audioWifiConnected) pushStatus("Нет Wi-Fi");
                 else {
 
                     pushStatus("Подключение...");
@@ -2132,14 +2215,14 @@ void audio_task(void*) {
             vTaskDelay(1);
             continue;
         }
-        if (wantPlayback && currentStation>=0 && WiFi.status()!=WL_CONNECTED) {
+        if (wantPlayback && currentStation>=0 && !audioWifiConnected) {
             if(running) audio.stopSong();
             running=false;
             isPlaying=false;
             if(wasRunning) pushStatus("Нет сети: ожидание Wi-Fi");
         }
         // Переподключаюсь только при сохранённом намерении играть и доступном Wi-Fi. После открытия снова применяю текущую громкость.
-        if(wantPlayback && !running && currentStation>=0 && WiFi.status()==WL_CONNECTED && int32_t(millis()-nextRetry)>=0) {
+        if(wantPlayback && !running && currentStation>=0 && audioWifiConnected && int32_t(millis()-nextRetry)>=0) {
             const auto* station=selectedStation(currentStation);
             if(station) {
                 pushStatus("Переподключение...");
@@ -2201,6 +2284,7 @@ void gui_task(void*) {
     lv_indev_set_display(indev, disp);
     lv_indev_set_type(indev, LV_INDEV_TYPE_POINTER);
     lv_indev_set_read_cb(indev, touchRead);
+    lv_timer_set_period(lv_indev_get_read_timer(indev), 10);
 
     buildMainScreen();
 
@@ -2281,11 +2365,14 @@ void gui_task(void*) {
             lastWifiCheck = now;
             updateWifiIndicator();
             if (remoteAddressLabel) {
-                String address = WiFi.status() == WL_CONNECTED
-                    ? "Веб-пульт:\nhttp://" + WiFi.localIP().toString() + ":8080"
-                    : "Веб-пульт: нет Wi-Fi";
-                if (strcmp(lv_label_get_text(remoteAddressLabel), address.c_str()))
-                    lv_label_set_text(remoteAddressLabel, address.c_str());
+                char address[80];
+                if (WiFi.status() == WL_CONNECTED) {
+                    const IPAddress ip = WiFi.localIP();
+                    snprintf(address, sizeof(address), "Веб-пульт:\nhttp://%u.%u.%u.%u:8080",
+                             unsigned(ip[0]), unsigned(ip[1]), unsigned(ip[2]), unsigned(ip[3]));
+                } else strlcpy(address, "Веб-пульт: нет Wi-Fi", sizeof(address));
+                if (strcmp(lv_label_get_text(remoteAddressLabel), address))
+                    lv_label_set_text(remoteAddressLabel, address);
             }
             updateBatteryIndicator();
             time_t t=time(nullptr);
@@ -2310,20 +2397,39 @@ void gui_task(void*) {
         refreshLocalWifi();
         updateGallery();
         lv_timer_handler();
+        if (pendingPhotoSwipe) {
+            const int action = pendingPhotoSwipe;
+            pendingPhotoSwipe = 0;
+            if (photoViewing && lv_screen_active() == galleryScreen) {
+                if (action == 2) photoExit(nullptr);
+                else if (!photoFiles.empty() && photoCurrent >= 0) {
+                    const int count = int(photoFiles.size());
+                    photoShow((photoCurrent + action + count) % count);
+                }
+            }
+        }
         if (volumePopupOpen && millis() - volumePopupActivity >= 3000)
             closeVolumePopup(nullptr);
         if (pendingLocalWifiSwipe) {
             pendingLocalWifiSwipe = false;
-            openLocalWifi();
+            slideToScreen(localWifiScreen, false);
+            if (!localWifiBusy.load()) localWifiStart(false);
         }
         if (pendingPlayingSwipe) {
-            lv_screen_load(pendingPlayingSwipe > 0 ? debugScreen : mainScreen);
+            slideToScreen(pendingPlayingSwipe > 0 ? debugScreen : mainScreen, pendingPlayingSwipe > 0);
             pendingPlayingSwipe = 0;
         }
         if (pendingScreenSwipe) {
-            lv_screen_load(pendingScreenSwipe);
+            slideToScreen(pendingScreenSwipe, swipeMovesLeft);
             pendingScreenSwipe = nullptr;
         }
+        lv_obj_t* activeScreen = lv_screen_active();
+        bool hideVolume = activeScreen == settingsScreen || activeScreen == localWifiScreen || activeScreen == wifiScreen
+                       || (activeScreen == galleryScreen && photoViewing);
+        if (hideVolume) {
+            lv_obj_add_flag(globalVolumeButton, LV_OBJ_FLAG_HIDDEN);
+            if (volumePopupOpen) closeVolumePopup(nullptr);
+        } else lv_obj_remove_flag(globalVolumeButton, LV_OBJ_FLAG_HIDDEN);
         uint32_t timeout = sleepMinutes[sleepChoice.load()] * 60000UL;
         if (!displaySleeping && !suppressWakeTouch && timeout && millis() - lastTouchAt >= timeout) {
             displaySleeping = true;
@@ -2458,6 +2564,7 @@ void setup() {
     if (!wireDiagMutex) fatal("I2C diagnostic mutex failed");
 
     if (!es8311_init()) fatal("ES8311 init failed");
+    stationCatalogInit();
     // Восстанавливаю станции по URL; старый формат сбрасываю один раз.
     for (int i = 0; i < FAVORITES_COUNT; ++i) favoriteIds[i] = -1;
     favoriteIds[0] = FAV_0;
@@ -2465,6 +2572,11 @@ void setup() {
     favoriteIds[2] = FAV_2;
     favoriteIds[3] = FAV_3;
     if (radioPrefs.begin("radio", false)) {
+        if(stationCatalogLoaded) {
+            const int defaults[]={FAV_0,FAV_1,FAV_2,FAV_3};
+            for(int j=0;j<FAVORITES_COUNT;j++)favoriteIds[j]=-1;
+            for(int j=0;j<4;j++)for(int i=0;i<ALL_STATIONS_COUNT;i++)if(stationUrlMatches(i,String(BUILTIN_STATIONS[defaults[j]].url)))favoriteIds[j]=i;
+        }
         currentVolume = constrain(int(radioPrefs.getUChar("volume", 6)), 0, 21);
         currentBrightness = constrain(int(radioPrefs.getUChar("brightness", 100)), 15, 100);
         sleepChoice = constrain(int(radioPrefs.getUChar("sleep", 0)), 0, 6);
@@ -2472,7 +2584,7 @@ void setup() {
         if((ac&2047)>=1440) ac=360;
         String alarmUrl=radioPrefs.getString("alarmUrl", "");
         int station=-1;
-        for(int i=0;i<ALL_STATIONS_COUNT;i++) if(alarmUrl==ALL_STATIONS[i].url) {station=i; break;}
+        for(int i=0;i<ALL_STATIONS_COUNT;i++) if(stationUrlMatches(i,alarmUrl)) {station=i; break;}
         if(station<0) { for(int i=0;i<ALL_STATIONS_COUNT;i++) if(!strcmp(ALL_STATIONS[i].name,"Маяк")) station=i; }
         ac=(ac & ~(255UL<<11)) | (uint32_t(max(0,station))<<11);
         alarmConfig=ac; offConfig=(oc&2047)<1440?oc:1320;
@@ -2503,7 +2615,7 @@ void setup() {
                 int id = -1;
                 if (url.length()) {
                     for (int i = 0; i < ALL_STATIONS_COUNT; ++i) {
-                        if (url == ALL_STATIONS[i].url) { id = i; break; }
+                        if (stationUrlMatches(i,url)) { id = i; break; }
                     }
                 }
                 favoriteIds[j] = id;
@@ -2512,7 +2624,7 @@ void setup() {
         savedUrl = radioPrefs.getString("station", "");
         if (savedUrl.length()) {
             for (int i = 0; i < ALL_STATIONS_COUNT; ++i)
-            if (savedUrl == ALL_STATIONS[i].url) {
+            if (stationUrlMatches(i,savedUrl)) {
                 savedStation = 100+i;
                 break;
             }
@@ -2521,28 +2633,22 @@ void setup() {
     setBrightness(currentBrightness.load());
     // GUI запускается до блокирующего подключения Wi-Fi.
 
+    WiFi.mode(WIFI_STA);
+    WiFi.setSleep(false);
+    wifiSavedInit();
+    WiFi.setAutoReconnect(true);
+    WiFi.persistent(true);
+    WiFi.begin();
     if (xTaskCreatePinnedToCore(gui_task, "gui", 12288, nullptr, 5, nullptr, 1) != pdPASS) fatal("gui task");
     /* ---- WiFi: подключаемся к сохранённой сети, портал НЕ запускаем ---- */
-    WiFi.mode(WIFI_STA);
-    WiFi.setAutoReconnect(true);
     configTime(3*3600,0,"pool.ntp.org","time.google.com");
     // Moscow time
-    WiFi.persistent(true);
-    WiFiManager wm;
-    wm.setDebugOutput(false);
-    wm.setEnableConfigPortal(false);
-    // портал только по кнопке
-    wm.setConnectTimeout(30);
-    // 30 секунд на попытку
-    if (wm.autoConnect()) {
-
-    } else {
-
-    }
+    // Association was initiated before GUI; no overlapping startup manager.
 
     // Разделяю звук и графику по ядрам, сохраняя проверенные размеры стеков и приоритеты. Эти размеры — рабочий стек задач, не сетевой буфер.
     if (xTaskCreatePinnedToCore(audio_task, "audio", 20480, nullptr, 2, nullptr, 0) != pdPASS) fatal("audio task");
     startWebRemote();
+    if (xTaskCreatePinnedToCore(wifiSavedTask, "wifi_saved", 6144, nullptr, 1, nullptr, 0) != pdPASS) fatal("wifi saved task");
 
 }
 // Основная работа уже выполняется отдельными задачами. Здесь только освобождаю процессор задержкой, без дополнительного обслуживания Audio или LVGL.

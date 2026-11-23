@@ -1,4 +1,5 @@
 #pragma once
+#include "station_catalog.h"
 // Веб-пульт храню в прошивке. HTTP обслуживает собственная задача
 // ESP-IDF с низким приоритетом; из неё не вызываю Audio, LVGL или Preferences.
 // Порт 8080 отделяю от порта 80 существующей настройки Wi-Fi.
@@ -59,6 +60,7 @@ details.mp3{background:#101410;border:1px solid #344438;border-top:3px solid #80
 <section class="section"><h2>Избранное <span id="favoriteCount" style="color:#aaa;font-size:18px">· 0 из 20</span></h2><div id="favorites"></div></section>
 <section class="section"><h2>Станции</h2><select aria-label="Выбор станции" id="stations"></select><div class="actions"><button id="play">Слушать выбранную</button></div>
 <p style="color:#aaa;margin:14px 0 8px">Выбранная станция</p><div class="actions minor"><button id="selectedFavorite" disabled>Выберите станцию</button></div></section>
+<details class="section"><summary>Редактор станций на SD</summary><p id="catalogInfo"></p><p>Изменения применяются после перезапуска радио. До него текущий список и звук не меняются.</p><select id="catalogSelect"></select><label>Название<input id="catalogName" maxlength="120" style="width:100%"></label><label>Адрес потока<input id="catalogUrl" maxlength="768" style="width:100%"></label><div class="actions"><button id="catalogUpdate">Изменить</button><button id="catalogAdd">Добавить</button><button id="catalogDelete">Удалить</button></div><button id="catalogSave">Сохранить на SD</button><p id="catalogResult"></p></details>
 <section class="section settings"><h2>Настройки</h2><label>Яркость <span class="value" id="brightnessText"></span><input id="brightness" type="range" min="15" max="100"></label>
 <div class="settings-grid"><label>Сон экрана<select id="sleep"><option value="0">Выключен</option><option value="1">Через 2 минуты</option><option value="2">Через 5 минут</option><option value="3">Через 10 минут</option><option value="4">Через 15 минут</option><option value="5">Через 30 минут</option><option value="6">Через час</option></select></label>
 <div><label>Остановка радио<select id="timer"><option value="0">Отменить таймер</option><option value="1">Через 15 минут</option><option value="2">Через 30 минут</option><option value="3">Через 60 минут</option><option value="4">Через 90 минут</option></select></label><button id="setTimer">Применить таймер</button><p id="remaining"></p></div></div></section>
@@ -79,7 +81,7 @@ button.onclick=()=>command(exists?'favremove':'favadd',id);
 }
 }
 async function command(action,value){try{const r=await fetch('/api/control',{method:'POST',headers:{'Content-Type':'application/x-www-form-urlencoded','X-Radio-Control':'1'},body:new URLSearchParams({action,value:String(value??'')})});if(!r.ok)throw Error(await r.text());$('error').textContent='';await refresh()}catch(e){$('error').textContent='Команда не принята: '+e.message}}
-async function refresh(){if(busy)return;busy=true;try{const r=await fetch('/api/state',{cache:'no-store',signal:AbortSignal.timeout(4000)});if(!r.ok)throw Error('HTTP '+r.status);const s=await r.json();remoteStateCache=s;$('station').textContent=s.name||'Станция не выбрана';$('status').textContent=s.status;$('toggle').textContent=s.requested?'Пауза':'Продолжить';$('toggle').disabled=s.station<0;if(!editing){$('volume').value=s.volume;$('volumeText').textContent=Math.round(s.volume*100/21)+'%'}if(!loaded){for(const x of s.stations){const o=document.createElement('option');o.value=x.id;o.textContent=x.name;$('stations').append(o)}loaded=true;if(s.station>=0)$('stations').value=s.station}if(!brightEditing){$('brightness').value=s.brightness;$('brightnessText').textContent=s.brightness+'%'}
+async function refresh(){if(busy)return;busy=true;try{const r=await fetch('/api/state'+(loaded?'':'?full=1'),{cache:'no-store',signal:AbortSignal.timeout(4000)});if(!r.ok)throw Error('HTTP '+r.status);const s=await r.json();if(!s.stations)s.stations=remoteStateCache?.stations||[];remoteStateCache=s;$('station').textContent=s.name||'Станция не выбрана';$('status').textContent=s.status;$('toggle').textContent=s.requested?'Пауза':'Продолжить';$('toggle').disabled=s.station<0;if(!editing){$('volume').value=s.volume;$('volumeText').textContent=Math.round(s.volume*100/21)+'%'}if(!loaded){for(const x of s.stations){const o=document.createElement('option');o.value=x.id;o.textContent=x.name;$('stations').append(o)}loaded=true;if(s.station>=0)$('stations').value=s.station}if(!brightEditing){$('brightness').value=s.brightness;$('brightnessText').textContent=s.brightness+'%'}
 updateFavoriteButtons();
 updateMp3(s.mp3);
 if(document.activeElement!==$('sleep'))$('sleep').value=s.sleep;
@@ -120,77 +122,116 @@ $('mp3PrevPage').onclick=()=>{if(mp3Page>0){mp3Page--;loadMp3Files()}};
 $('mp3NextPage').onclick=()=>{if((mp3Page+1)*30<(remoteStateCache?.mp3.count||0)){mp3Page++;loadMp3Files()}};
 $('mp3Seek').oninput=()=>seekEditing=true;
 $('mp3Seek').onchange=()=>{seekEditing=false;command('sdseek',$('mp3Seek').value)};
-refresh();setInterval(refresh,2000);
+let catalog=null;
+function drawCatalog(){const sel=$('catalogSelect');sel.replaceChildren();for(const [i,x] of catalog.stations.entries()){const o=document.createElement('option');o.value=i;o.textContent=x.name;sel.append(o)}selectCatalog()}
+function selectCatalog(){const x=catalog?.stations[Number($('catalogSelect').value)];$('catalogName').value=x?.name||'';$('catalogUrl').value=x?.url||''}
+$('catalogSelect').onchange=selectCatalog;
+async function loadCatalog(){try{const r=await fetch('/api/catalog');const d=await r.json();$('catalogInfo').textContent=d.message;catalog=d.catalog;for(const id of ['catalogSelect','catalogName','catalogUrl','catalogUpdate','catalogAdd','catalogDelete','catalogSave'])$(id).disabled=!d.writable;if(d.writable)drawCatalog()}catch(e){$('catalogInfo').textContent='Не удалось прочитать каталог'}}
+function editCatalog(add){const name=$('catalogName').value.trim(),url=$('catalogUrl').value.trim();if(!name||!/^https?:\/\/\S+$/.test(url))return alert('Введите название и HTTP/HTTPS адрес потока');if(catalog.stations.some((x,i)=>x.url===url&&(add||i!==Number($('catalogSelect').value))))return alert('Этот адрес уже есть');if(add){if(catalog.stations.length>=150)return alert('Максимум 150 станций');catalog.stations.push({name,url})}else{const x=catalog.stations[Number($('catalogSelect').value)];if(x.url!==url){x.aliases=[...new Set([...(x.aliases||[]),x.url])];if(x.aliases.length>16)return alert('Слишком много замен адреса: удалите и добавьте станцию заново')}x.name=name;x.url=url}drawCatalog();$('catalogResult').textContent='Есть несохранённые изменения'}
+$('catalogUpdate').onclick=()=>editCatalog(false);$('catalogAdd').onclick=()=>editCatalog(true);
+$('catalogDelete').onclick=()=>{if(catalog.stations.length<=1)return alert('Оставьте хотя бы одну станцию');if(confirm('Удалить выбранную станцию?')){catalog.stations.splice(Number($('catalogSelect').value),1);drawCatalog();$('catalogResult').textContent='Есть несохранённые изменения'}};
+$('catalogSave').onclick=async()=>{const b=$('catalogSave');b.disabled=true;try{const r=await fetch('/api/catalog',{method:'POST',headers:{'Content-Type':'application/json','X-Radio-Control':'1'},body:JSON.stringify(catalog)});if(!r.ok)throw Error(await r.text());$('catalogResult').textContent='Сохранено. Перезапустите радио, чтобы применить список.'}catch(e){$('catalogResult').textContent='Не сохранено: '+e.message}finally{b.disabled=false}};
+loadCatalog();
+async function poll(){await refresh();setTimeout(poll,2000)}poll();
 </script></body></html>)HTML";
 
 // Экранирую строки JSON, чтобы названия из моего списка не ломали ответ.
-static String remoteJson(const char* text) {
-    String out = "\"";
-    for (const unsigned char* p = (const unsigned char*)text; *p; ++p) {
-        if (*p == '"' || *p == '\\') { out += '\\'; out += char(*p); }
-        else if (*p < 32) { char b[7]; snprintf(b, sizeof(b), "\\u%04x", *p); out += b; }
-        else out += char(*p);
+// A bounded output buffer; failures stop further writes, never send partial success.
+class RemoteJsonWriter {
+    httpd_req_t* req; char buffer[512]; size_t used=0; esp_err_t result=ESP_OK;
+public:
+    explicit RemoteJsonWriter(httpd_req_t* r):req(r) {
+        httpd_resp_set_type(req,"application/json; charset=utf-8");
+        httpd_resp_set_hdr(req,"Cache-Control","no-store");
     }
-    return out + '"';
-}
+    void flush() {
+        if(result==ESP_OK && used) result=httpd_resp_send_chunk(req,buffer,used);
+        used=0;
+    }
+    void ch(char c) { if(result!=ESP_OK)return; if(used==sizeof(buffer))flush(); if(result==ESP_OK)buffer[used++]=c; }
+    void text(const char* s) { while(*s && result==ESP_OK)ch(*s++); }
+    void number(long n) { char b[24];snprintf(b,sizeof(b),"%ld",n);text(b); }
+    void boolean(bool b) { text(b?"true":"false"); }
+    void json(const char* s) {
+        ch('"');
+        for(const unsigned char* p=(const unsigned char*)s;*p && result==ESP_OK;++p) {
+            if(*p=='"'||*p=='\\'){ch('\\');ch(*p);}
+            else if(*p<32){char b[7];snprintf(b,sizeof(b),"\\u%04x",*p);text(b);}
+            else ch(*p);
+        }
+        ch('"');
+    }
+    esp_err_t finish() {flush();return result==ESP_OK?httpd_resp_send_chunk(req,nullptr,0):result;}
+};
 static esp_err_t remoteRoot(httpd_req_t* req) {
-    httpd_resp_set_type(req, "text/html; charset=utf-8");
-    return httpd_resp_send(req, remotePage, sizeof(remotePage)-1);
+    httpd_resp_set_type(req,"text/html; charset=utf-8");
+    return httpd_resp_send(req,remotePage,sizeof(remotePage)-1);
 }
-static String remoteMp3Name(int index) {
-    if(sdScanState.load()!=2 || index<0 || index>=int(sdMp3Files.size())) return "";
-    const String& path=sdMp3Files[index]; return path.substring(path.lastIndexOf('/')+1);
+// Copy under the playlist mutex; never keep it locked during network sends.
+static bool remoteMp3Name(int index,char* name,size_t capacity) {
+    name[0]=0;
+    if(xSemaphoreTake(sdFilesMutex,pdMS_TO_TICKS(20))!=pdTRUE)return false;
+    bool ready=sdScanState.load()==2;
+    if(ready && index>=0 && index<sdFileCount.load()) {
+        const char* path=sdMp3Files[index].c_str();
+        const char* slash=strrchr(path,'/');
+        strlcpy(name,slash?slash+1:path,capacity);
+    }
+    xSemaphoreGive(sdFilesMutex);
+    return ready;
 }
 static esp_err_t remoteMp3Files(httpd_req_t* req) {
-    char query[32]={}, value[12]={}; int page=0;
+    char query[32]={},value[12]={};int page=0;
     if(httpd_req_get_url_query_str(req,query,sizeof(query))==ESP_OK && httpd_query_key_value(query,"page",value,sizeof(value))==ESP_OK) {
-        char* end; long n=strtol(value,&end,10);
-        if(!value[0]||*end||n<0||n>66) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid page");
+        char* end;long n=strtol(value,&end,10);
+        if(!value[0]||*end||n<0||n>66)return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid page");
         page=int(n);
     }
-    String body="{\"files\":[";
-    if(sdScanState.load()==2) {
-        int end=std::min((page+1)*30,int(sdMp3Files.size()));
-        for(int i=page*30;i<end;i++) {if(i!=page*30)body+=',';body+="{\"id\":"+String(i)+",\"name\":"+remoteJson(remoteMp3Name(i).c_str())+'}';}
+    // Snapshot this page, then release the mutex before any TCP transmission.
+    String names[30];int count=0;
+    if(xSemaphoreTake(sdFilesMutex,pdMS_TO_TICKS(20))!=pdTRUE) {
+        httpd_resp_set_status(req,"503 Service Unavailable");
+        return httpd_resp_send(req,"Playlist busy",HTTPD_RESP_USE_STRLEN);
     }
-    body+="]}"; httpd_resp_set_type(req,"application/json; charset=utf-8");
-    httpd_resp_set_hdr(req,"Cache-Control","no-store"); return httpd_resp_send(req,body.c_str(),body.length());
+    if(sdScanState.load()==2) {
+        int end=std::min((page+1)*30,sdFileCount.load());
+        for(int i=page*30;i<end;++i) {
+            const String& path=sdMp3Files[i];names[count++]=path.substring(path.lastIndexOf('/')+1);
+        }
+    }
+    xSemaphoreGive(sdFilesMutex);
+    RemoteJsonWriter out(req);out.text("{\"files\":[");
+    for(int i=0;i<count;++i){if(i)out.ch(',');out.text("{\"id\":");out.number(page*30+i);out.text(",\"name\":");out.json(names[i].c_str());out.ch('}');}
+    out.text("]}");return out.finish();
 }
 static esp_err_t remoteState(httpd_req_t* req) {
-    char status[96];
-    portENTER_CRITICAL(&webStatusMux);
-    strlcpy(status, webStatus, sizeof(status));
-    portEXIT_CRITICAL(&webStatusMux);
-    int id = currentStation;
-    if (id >= 100) id -= 100;
-    else if (id >= 0 && id < FAVORITES_COUNT) id = favoriteIds[id].load();
-    if (id < 0 || id >= ALL_STATIONS_COUNT) id = -1;
-    String body; body.reserve(8192);
-    body = "{\"station\":" + String(id) + ",\"name\":";
-    body += remoteJson(id >= 0 ? ALL_STATIONS[id].name : "");
-    body += ",\"status\":" + remoteJson(status);
-    body += ",\"requested\":"; body += wantPlayback.load() ? "true" : "false";
-    body += ",\"volume\":" + String(currentVolume.load()) + ",\"stations\":[";
-    for (int i=0; i<ALL_STATIONS_COUNT; ++i) {
-        if(i) body += ',';
-        body += "{\"id\":" + String(i) + ",\"name\":" + remoteJson(ALL_STATIONS[i].name) + '}';
+    char query[32] = {}, fullValue[8] = {};
+    const bool full = httpd_req_get_url_query_str(req, query, sizeof(query)) == ESP_OK &&
+        httpd_query_key_value(query, "full", fullValue, sizeof(fullValue)) == ESP_OK &&
+        strcmp(fullValue, "1") == 0;
+    char status[96],name[512];
+    portENTER_CRITICAL(&webStatusMux);strlcpy(status,webStatus,sizeof(status));portEXIT_CRITICAL(&webStatusMux);
+    int id=currentStation;
+    if(id>=100)id-=100;else if(id>=0 && id<FAVORITES_COUNT)id=favoriteIds[id].load();
+    if(id<0||id>=ALL_STATIONS_COUNT)id=-1;
+    int track=sdCurrent.load(); bool ready=remoteMp3Name(track,name,sizeof(name));
+    RemoteJsonWriter out(req);
+    out.text("{\"station\":");out.number(id);out.text(",\"name\":");out.json(id>=0?ALL_STATIONS[id].name:"");
+    out.text(",\"status\":");out.json(status);out.text(",\"requested\":");out.boolean(wantPlayback.load());
+    out.text(",\"volume\":");out.number(currentVolume.load());
+    if(full) {
+        out.text(",\"stations\":[");
+        for(int i=0;i<ALL_STATIONS_COUNT;++i){if(i)out.ch(',');out.text("{\"id\":");out.number(i);out.text(",\"name\":");out.json(ALL_STATIONS[i].name);out.ch('}');}
+        out.ch(']');
     }
-    body += "],\"favorites\":[";
-    for(int i=0;i<FAVORITES_COUNT;i++){if(i)body+=',';body+=String(favoriteIds[i].load());}
-    uint32_t deadline=radioDeadline.load();
-    int32_t left=deadline ? int32_t(deadline-millis()) : 0;
-    body += "],\"brightness\":" + String(currentBrightness.load());
-    body += ",\"sleep\":" + String(sleepChoice.load());
-    body += ",\"remaining\":" + String(left>0 ? (left+999)/1000 : 0) + "}";
-    body.remove(body.length()-1);
-    body+=",\"mp3\":{\"scan\":"+String(sdScanState.load())+",\"count\":"+String(sdScanState.load()==2?sdMp3Files.size():0);
-    body+=",\"current\":"+String(sdCurrent.load())+",\"name\":"+remoteJson(remoteMp3Name(sdCurrent.load()).c_str());
-    body+=",\"active\":"; body+=sdActive.load()?"true":"false";
-    body+=",\"paused\":"; body+=sdPaused.load()?"true":"false";
-    body+=",\"elapsed\":"+String(sdElapsed.load())+",\"duration\":"+String(sdDuration.load())+"}}";
-    httpd_resp_set_type(req, "application/json; charset=utf-8");
-    httpd_resp_set_hdr(req, "Cache-Control", "no-store");
-    return httpd_resp_send(req, body.c_str(), body.length());
+    out.text(",\"favorites\":[");for(int i=0;i<FAVORITES_COUNT;++i){if(i)out.ch(',');out.number(favoriteIds[i].load());}
+    uint32_t deadline=radioDeadline.load();int32_t left=deadline?int32_t(deadline-millis()):0;
+    out.text("],\"brightness\":");out.number(currentBrightness.load());out.text(",\"sleep\":");out.number(sleepChoice.load());
+    out.text(",\"remaining\":");out.number(left>0?(left+999)/1000:0);
+    out.text(",\"mp3\":{\"scan\":");out.number(sdScanState.load());out.text(",\"count\":");out.number(ready?sdFileCount.load():0);
+    out.text(",\"current\":");out.number(track);out.text(",\"name\":");out.json(name);
+    out.text(",\"active\":");out.boolean(sdActive.load());out.text(",\"paused\":");out.boolean(sdPaused.load());
+    out.text(",\"elapsed\":");out.number(sdElapsed.load());out.text(",\"duration\":");out.number(sdDuration.load());out.text("}}");return out.finish();
 }
 static esp_err_t remoteControl(httpd_req_t* req) {
     // Требую собственный заголовок браузера; CORS не разрешаю. Чужая страница
@@ -200,6 +241,11 @@ static esp_err_t remoteControl(httpd_req_t* req) {
         return httpd_resp_send_err(req, HTTPD_403_FORBIDDEN, "Forbidden");
     if (req->content_len <= 0 || req->content_len >= 96)
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Invalid body");
+    char contentType[80];
+    if(httpd_req_get_hdr_value_str(req,"Content-Type",contentType,sizeof(contentType))!=ESP_OK ||
+       strncasecmp(contentType,"application/x-www-form-urlencoded",33) ||
+       (contentType[33] && contentType[33]!=';' && contentType[33]!=' '))
+        return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid Content-Type");
     char body[96] = {}, action[20] = {}, value[12] = {};
     int received = 0;
     while (received < req->content_len) {
@@ -211,12 +257,12 @@ static esp_err_t remoteControl(httpd_req_t* req) {
         return httpd_resp_send_err(req, HTTPD_400_BAD_REQUEST, "Missing action");
     if(!strncmp(action,"sd",2)) {
         if(!strcmp(action,"sdscan")) {sdWebScanRequested.store(true);return httpd_resp_send(req,"OK",2);}
-        if(sdScanState.load()!=2 || sdMp3Files.empty()) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"SD not ready");
+        if(sdScanState.load()!=2 || sdFileCount.load()==0) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"SD not ready");
         int index=sdCurrent.load();
         if(!strcmp(action,"sdfile") || !strcmp(action,"sdseek")) {
             if(httpd_query_key_value(body,"value",value,sizeof(value))!=ESP_OK) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Missing value");
             char* end; long n=strtol(value,&end,10);
-            long maximum=!strcmp(action,"sdfile")?long(sdMp3Files.size())-1:long(std::min(65535u,sdDuration.load()?sdDuration.load()-1:0u));
+            long maximum=!strcmp(action,"sdfile")?long(sdFileCount.load())-1:long(std::min(65535u,sdDuration.load()?sdDuration.load()-1:0u));
             if(!value[0]||*end||n<0||n>maximum) return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid value");
             if(!strcmp(action,"sdseek")) {
                 if(!sdActive.load()||!sdDuration.load())return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Cannot seek");
@@ -227,7 +273,7 @@ static esp_err_t remoteControl(httpd_req_t* req) {
         else if(!strcmp(action,"sdplay")){if(!sdActive.load()||sdPaused.load()){sdRequested.store(index<0?0:index);sdAction.store(1);}}
         else if(!strcmp(action,"sdprev")||!strcmp(action,"sdnext")) {
             index=index<0?0:index+(!strcmp(action,"sdprev")?-1:1);
-            if(index>=0&&index<int(sdMp3Files.size())){sdRequested.store(index);sdAction.store(1);}
+            if(index>=0&&index<sdFileCount.load()){sdRequested.store(index);sdAction.store(1);}
         }else return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Unknown action");
         return httpd_resp_send(req,"OK",2);
     }
@@ -278,6 +324,44 @@ static esp_err_t remoteControl(httpd_req_t* req) {
     }
     return httpd_resp_send(req,"OK",2);
 }
+// HTTP owns the editable disk snapshot. Live catalogue stays immutable until reboot.
+static esp_err_t remoteCatalog(httpd_req_t* req) {
+    static JsonDocument editorDisk;
+    static bool initialized=false;
+    if(!initialized){editorDisk.set(stationDisk);initialized=true;}
+    if(req->method==HTTP_GET) {
+        RemoteJsonWriter out(req);out.text("{\"writable\":");out.boolean(stationCatalogWritable);
+        out.text(",\"message\":");out.json(stationCatalogMessage);out.text(",\"catalog\":");
+        String json;serializeJson(editorDisk,json);out.text(json.c_str());out.ch('}');return out.finish();
+    }
+    char marker[8];
+    if(httpd_req_get_hdr_value_str(req,"X-Radio-Control",marker,sizeof(marker))!=ESP_OK || strcmp(marker,"1"))return httpd_resp_send_err(req,HTTPD_403_FORBIDDEN,"Forbidden");
+    if(!stationCatalogWritable)return httpd_resp_send_err(req,HTTPD_403_FORBIDDEN,"SD catalogue is read-only");
+    if(req->content_len<1 || req->content_len>196608)return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid size");
+    String body; if(!body.reserve(req->content_len+1))return httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,"No memory");
+    char chunk[512];int left=req->content_len;
+    while(left){int n=httpd_req_recv(req,chunk,std::min(left,int(sizeof(chunk))));if(n<=0)return httpd_resp_send_err(req,HTTPD_408_REQ_TIMEOUT,"Timeout");body.concat(chunk,n);left-=n;}
+    JsonDocument next;
+    if(deserializeJson(next,body) || !stationValidate(next))return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Invalid catalogue");
+    // aliases are derived on the device, not trusted from a browser.
+    JsonArray a=next["stations"].as<JsonArray>();
+    for(JsonObject o:a) {
+        String url=o["url"].as<String>();
+        for(JsonObject old:editorDisk["stations"].as<JsonArray>()) {
+            String previous=old["url"].as<String>();bool match=url==previous;
+            for(JsonVariant v:o["aliases"].as<JsonArray>())if(previous==v.as<String>())match=true;
+            if(match){JsonArray aliases=o["aliases"].to<JsonArray>();for(JsonVariant v:old["aliases"].as<JsonArray>())aliases.add(v.as<String>());if(url!=previous)aliases.add(previous);break;}
+        }
+    }
+    if(!stationValidate(next))return httpd_resp_send_err(req,HTTPD_400_BAD_REQUEST,"Too many previous addresses");
+    if(sdActive.load() || sdScanState.load()==1){httpd_resp_set_status(req,"409 Conflict");return httpd_resp_send(req,"Остановите MP3 и дождитесь завершения поиска на SD",HTTPD_RESP_USE_STRLEN);}
+    if(xSemaphoreTake(sdFilesMutex,pdMS_TO_TICKS(100))!=pdTRUE){httpd_resp_set_status(req,"503 Service Unavailable");return httpd_resp_send(req,"SD busy",HTTPD_RESP_USE_STRLEN);}
+    bool ok=stationWrite(next);xSemaphoreGive(sdFilesMutex);
+    if(!ok)return httpd_resp_send_err(req,HTTPD_500_INTERNAL_SERVER_ERROR,"SD write failed; previous catalogue preserved");
+    editorDisk.set(next);
+    // Keep boot-time aliases unchanged: audio task still uses them for settings.
+    return httpd_resp_send(req,"Saved; restart radio to apply",HTTPD_RESP_USE_STRLEN);
+}
 static void startWebRemote() {
     remoteSettingsQueue = xQueueCreate(8,sizeof(RemoteSetting));
     if(!remoteSettingsQueue){pushStatus("Нет памяти для веб-пульта");return;}
@@ -290,12 +374,14 @@ static void startWebRemote() {
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 2;
     config.send_wait_timeout = 2;
-    httpd_handle_t server = nullptr;
+    static httpd_handle_t server = nullptr;
     if (httpd_start(&server,&config) != ESP_OK) { pushStatus("Веб-пульт не запущен"); return; }
     httpd_uri_t root = {}; root.uri="/"; root.method=HTTP_GET; root.handler=remoteRoot;
     httpd_uri_t state = {}; state.uri="/api/state"; state.method=HTTP_GET; state.handler=remoteState;
     httpd_uri_t control = {}; control.uri="/api/control"; control.method=HTTP_POST; control.handler=remoteControl;
     httpd_uri_t mp3 = {}; mp3.uri="/api/mp3"; mp3.method=HTTP_GET; mp3.handler=remoteMp3Files;
+    httpd_uri_t cat={};cat.uri="/api/catalog";cat.method=HTTP_GET;cat.handler=remoteCatalog;
+    httpd_register_uri_handler(server,&cat);cat.method=HTTP_POST;httpd_register_uri_handler(server,&cat);
     httpd_register_uri_handler(server,&mp3);
     httpd_register_uri_handler(server,&root);
     httpd_register_uri_handler(server,&state);

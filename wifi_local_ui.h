@@ -1,9 +1,11 @@
 // Original text glyphs plus local 1bpp service icons; main font unchanged.
 LV_FONT_DECLARE(wifi_ui_font);
 // Local Wi-Fi setup. Only GUI touches LVGL; the worker owns network operations.
-static lv_obj_t *localWifiScreen, *localWifiList, *localWifiStatus;
-static lv_obj_t *localWifiEditor, *localWifiPassword, *localWifiKeyboard, *localWifiName;
+static lv_obj_t *localWifiList, *localWifiStatus;
+static lv_obj_t *localWifiPassword, *localWifiKeyboard, *localWifiName;
 static std::atomic<bool> localWifiBusy{false};
+static std::atomic<bool> wifiPortalBusy{false};
+static void startWifiConfirmed(lv_event_t*);
 static std::atomic<int> localWifiResult{0};
 static bool localWifiConnecting = false;
 static String localWifiNames[30];
@@ -74,10 +76,19 @@ static void localWifiProcessKey() {
     }
     lv_label_set_text(localWifiPassword, localWifiPasswordBuffer);
 }
+#include "wifi_saved.h"
 static void localWifiWorker(void*) {
     int result;
     if (!localWifiConnecting) {
-        int n = WiFi.scanNetworks(false, false, false, 120);
+        // A background attempt to reach an absent saved AP can prevent scanning.
+        WiFi.setAutoReconnect(false);
+        WiFi.mode(WIFI_STA);
+        if (WiFi.status() != WL_CONNECTED) {
+            WiFi.disconnect(false, false); // Keep saved credentials.
+            vTaskDelay(pdMS_TO_TICKS(200));
+        }
+        WiFi.scanDelete();
+        int n = WiFi.scanNetworks(false, false, false, 300);
         localWifiCount = 0;
         for (int i = 0; i < n && localWifiCount < 30; ++i) {
             String name = WiFi.SSID(i);
@@ -90,16 +101,19 @@ static void localWifiWorker(void*) {
         }
         WiFi.scanDelete();
         result = n < 0 ? 2 : 1;
+        WiFi.setAutoReconnect(true);
     } else {
         String previousName = WiFi.SSID(), previousKey = WiFi.psk();
         WiFi.setAutoReconnect(false);
         WiFi.persistent(false); // Save only after successful association.
         WiFi.disconnect(false, false);
+        wifiAuthFailures.store(0);
         WiFi.begin(localWifiSelected.c_str(), localWifiKey.c_str());
         uint32_t started = millis();
         while (WiFi.status() != WL_CONNECTED && millis() - started < 20000)
             vTaskDelay(pdMS_TO_TICKS(100));
         if (WiFi.status() == WL_CONNECTED) {
+            wifiSavedRemember(localWifiSelected, localWifiKey);
             // Persist the tested credentials without another disconnect.
             wifi_config_t config = {};
             strlcpy((char*)config.sta.ssid, localWifiSelected.c_str(), sizeof(config.sta.ssid));
@@ -107,6 +121,7 @@ static void localWifiWorker(void*) {
             esp_wifi_set_storage(WIFI_STORAGE_FLASH);
             result = esp_wifi_set_config(WIFI_IF_STA, &config) == ESP_OK ? 3 : 5;
         } else {
+            wifiSavedFailed(localWifiSelected);
             WiFi.disconnect(false, false);
             if (previousName.length()) WiFi.begin(previousName.c_str(), previousKey.c_str());
             result = 4;
@@ -119,7 +134,7 @@ static void localWifiWorker(void*) {
     vTaskDelete(nullptr);
 }
 static void localWifiStart(bool connect) {
-    if (localWifiBusy.exchange(true)) return;
+    if (wifiPortalBusy.load() || localWifiBusy.exchange(true)) return;
     localWifiConnecting = connect;
     lv_label_set_text(localWifiStatus, connect ? "Подключение…" : "Поиск сетей…");
     if (xTaskCreatePinnedToCore(localWifiWorker, "wifi_local", 6144, nullptr, 1, nullptr, 0) != pdPASS) {
@@ -146,6 +161,10 @@ static void localWifiSelect(lv_event_t* e) {
     if (localWifiBusy.load()) return;
     int i = (int)(intptr_t)lv_event_get_user_data(e);
     localWifiSelected = localWifiNames[i];
+    if (lv_event_get_code(e) != LV_EVENT_LONG_PRESSED && wifiSavedKey(localWifiSelected, localWifiKey)) {
+        localWifiStart(true);
+        return;
+    }
     lv_label_set_text(localWifiName, localWifiSelected.c_str());
     localWifiClearPassword();
     lv_label_set_text(localWifiStatus, localWifiOpen[i] ? "Сеть без пароля" : "Введите пароль Wi-Fi");
@@ -174,11 +193,12 @@ static void buildLocalWifiScreen() {
     lv_obj_set_pos(localWifiStatus, 6, 42); lv_obj_set_size(localWifiStatus, 228, 48);
     lv_label_set_text(localWifiStatus, "Доступные сети Wi-Fi");
     localWifiList = mustCreate(localWifiScreen, "localWifiList");
-    lv_obj_set_pos(localWifiList, 0, 94); lv_obj_set_size(localWifiList, 240, 226);
+    lv_obj_set_pos(localWifiList, 0, 94); lv_obj_set_size(localWifiList, 240, 184);
     lv_obj_set_style_pad_all(localWifiList, 4, 0);
     lv_obj_set_style_bg_color(localWifiList, lv_color_hex(0), 0);
     lv_obj_set_style_border_width(localWifiList, 0, 0);
     lv_obj_set_scroll_dir(localWifiList, LV_DIR_VER);
+    localWifiButton(localWifiScreen, "Портал Wi-Fi", 4, 282, 232, startWifiConfirmed);
     localWifiEditor = mustCreate(localWifiScreen, "localWifiEditor");
     lv_obj_set_pos(localWifiEditor, 0, 88); lv_obj_set_size(localWifiEditor, 240, 232);
     lv_obj_set_style_pad_all(localWifiEditor, 0, 0);
@@ -259,8 +279,9 @@ static void refreshLocalWifi() {
             lv_label_set_long_mode(l, LV_LABEL_LONG_MODE_CLIP);
             lv_label_set_text(l, localWifiNames[i].c_str()); lv_obj_center(l);
             lv_obj_add_event_cb(b, localWifiSelect, LV_EVENT_SHORT_CLICKED, (void*)(intptr_t)i);
+            lv_obj_add_event_cb(b, localWifiSelect, LV_EVENT_LONG_PRESSED, (void*)(intptr_t)i);
         }
-        lv_label_set_text(localWifiStatus, localWifiCount ? "Выберите сеть" : "Сети не найдены");
+        lv_label_set_text(localWifiStatus, localWifiCount ? "Выберите сеть. Удержание: пароль" : "Сети не найдены");
     } else lv_label_set_text(localWifiStatus, result == 2 ? "Ошибка поиска. Повторите" :
         result == 3 ? "Подключено. Сеть сохранена" : result == 5 ? "Подключено, ошибка сохранения" : "Не подключено. Возврат к прежней сети");
 }

@@ -2,6 +2,9 @@
 // LCDWIKI ES3C28P: CLK38 CMD40 DATA0=39 DATA1=41 DATA2=48 DATA3=47.
 // One-bit mode uses CLK/CMD/DATA0; never formats the card.
 static std::vector<String> sdMp3Files;
+static std::atomic<int> sdFileCount{0};
+static StaticSemaphore_t sdFilesMutexStorage;
+static SemaphoreHandle_t sdFilesMutex=xSemaphoreCreateMutexStatic(&sdFilesMutexStorage);
 static std::atomic<int> sdScanState{0}; // 0 idle, 1 scanning, 2 ready, 3 unreadable
 static bool sdScanLimited = false;
 static std::vector<String> sdFolders;
@@ -109,7 +112,13 @@ static bool sdNaturalLess(const String& a, const String& b) {
     }
     return *x==0 && *y!=0;
 }
-static void sdWalk(const String& path, unsigned depth) {
+// Each scan owns its clock, including recursive directory walks.
+static void sdScanPause(uint32_t& last) {
+    if(uint32_t(millis()-last)<10u) return;
+    vTaskDelay(1); // At least one tick so IDLE can run.
+    last=millis();
+}
+static void sdWalkBudget(const String& path, unsigned depth, uint32_t& last) {
     if(depth>16 || sdMp3Files.size()>=2000) { sdScanLimited=true; return; }
     File dir=SD_MMC.open(path);
     if(!dir || !dir.isDirectory()) return;
@@ -119,7 +128,7 @@ static void sdWalk(const String& path, unsigned depth) {
         if(slash>=0) name=name.substring(slash+1);
         if(f.isDirectory()) folders.push_back(name);
         else { String lower=name; lower.toLowerCase(); if(lower.endsWith(".mp3")) files.push_back(name); }
-        f.close(); vTaskDelay(1);
+        f.close(); sdScanPause(last);
     }
     dir.close();
     std::sort(files.begin(), files.end(), sdNaturalLess);
@@ -131,8 +140,12 @@ static void sdWalk(const String& path, unsigned depth) {
     }
     for(const auto& name:folders) {
         if(sdCollectFolders) sdFolders.push_back(prefix+name);
-        if(sdCollectFolders || sdBuildRecursive) sdWalk(prefix+name,depth+1);
+        if(sdCollectFolders || sdBuildRecursive) sdWalkBudget(prefix+name,depth+1,last);
     }
+}
+static void sdWalk(const String& path, unsigned depth) {
+    uint32_t last=millis();
+    sdWalkBudget(path,depth,last);
 }
 // Playlist snapshot lives on SD, not in the small settings partition.
 static bool sdSavePlaylist() {
@@ -153,18 +166,23 @@ static void sdLoadPlaylist() {
     String header=f.readStringUntil('\n'); header.trim();
     if(header!="RADIO-PLAYLIST-1") {f.close(); return;}
     sdMp3Files.clear();
+    uint32_t last=millis();
     while(f.available() && sdMp3Files.size()<2000) {
         String path=f.readStringUntil('\n'); if(path.endsWith("\r")) path.remove(path.length()-1);
         if(path.startsWith("/") && SD_MMC.exists(path)) sdMp3Files.push_back(path);
-        vTaskDelay(1);
+        sdScanPause(last);
     }
     f.close();
 }
 static void sdScanTask(void*) {
+    xSemaphoreTake(sdFilesMutex,portMAX_DELAY);
+    sdFileCount.store(0);
     SD_MMC.end(); sdMp3Files.clear(); sdFolders.clear(); sdScanLimited=false; sdCollectFolders=true;
     SD_MMC.setPins(38,40,39,41,48,47);
     if(!SD_MMC.begin("/sdcard",false,false) || SD_MMC.cardType()==CARD_NONE) sdScanState.store(3);
     else {sdWalk("/",0); sdCollectFolders=false; sdLoadPlaylist(); if(!SD_MMC.exists("/.radio-playlist.txt")) sdSavePlaylist(); sdScanState.store(2);}
+    sdFileCount.store(sdScanState.load()==2 ? int(sdMp3Files.size()) : 0);
+    xSemaphoreGive(sdFilesMutex);
     vTaskDelete(nullptr);
 }
 static void sdRetry(lv_event_t*) {
@@ -229,6 +247,8 @@ static lv_obj_t* sdButton(const char* text,int x,int y,int w,lv_event_cb_t cb,vo
 // Rebuild only after the Audio-owning task acknowledges stop. No SD writes.
 static void sdPlaylistTask(void*) {
     while(!sdEditStopped.load()) vTaskDelay(1);
+    xSemaphoreTake(sdFilesMutex,portMAX_DELAY);
+    sdFileCount.store(0);
     int operation=sdPlaylistOperation.load();
     std::vector<String> previous;
     if(operation==2) previous.swap(sdMp3Files);
@@ -244,8 +264,10 @@ static void sdPlaylistTask(void*) {
         sdMp3Files.swap(previous);
     }
     sdSavePlaylist();
+    sdFileCount.store(int(sdMp3Files.size()));
     sdPlaylistOperation.store(0);
     sdScanState.store(2);
+    xSemaphoreGive(sdFilesMutex);
     vTaskDelete(nullptr);
 }
 static void sdCloseFolders(lv_event_t*) {

@@ -5,7 +5,7 @@ struct RadioStation {
     const char* name;
     const char* url;
 };
-const RadioStation ALL_STATIONS[] = {
+const RadioStation BUILTIN_STATIONS[] = {
     {"25 Регион", "https://aska.ru-hoster.com:8024/25Region_live"},
     {"Business FM", "https://bfm.hostingradio.ru:8004/bfm32.aacp"},
     {"Comedy Radio", "https://gpm.hostingradio.ru/gpm-comedyradio495.aacp"},
@@ -70,15 +70,19 @@ const RadioStation ALL_STATIONS[] = {
     {"Хит FM", "https://hitfm.hostingradio.ru/hitfm96.aacp"},
     {"Юмор FM", "https://gpm.hostingradio.ru/gpm-humorfm495.aacp"},
 };
-constexpr int ALL_STATIONS_COUNT = sizeof(ALL_STATIONS) / sizeof(ALL_STATIONS[0]);
+constexpr int BUILTIN_STATIONS_COUNT = sizeof(BUILTIN_STATIONS) / sizeof(BUILTIN_STATIONS[0]);
 constexpr int FAV_0 = 7; // Вести FM
 constexpr int FAV_1 = 20; // Маяк
 constexpr int FAV_2 = 21; // Модель для сборки
 constexpr int FAV_3 = 56; // Соловьев Live
 const RadioStation FAVORITES[] = {
-    ALL_STATIONS[FAV_0], ALL_STATIONS[FAV_1],
-    ALL_STATIONS[FAV_2], ALL_STATIONS[FAV_3],
+    BUILTIN_STATIONS[FAV_0], BUILTIN_STATIONS[FAV_1],
+    BUILTIN_STATIONS[FAV_2], BUILTIN_STATIONS[FAV_3],
 };
 constexpr int FAVORITES_COUNT = 20;
 // Версия формата хранения, не версия списка. Не повышать при добавлении станций.
 constexpr int STATION_STORAGE_VERSION = 2;
+
+constexpr int MAX_STATIONS = 150;
+static RadioStation ALL_STATIONS[MAX_STATIONS];
+static int ALL_STATIONS_COUNT = BUILTIN_STATIONS_COUNT;

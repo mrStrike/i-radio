@@ -3,12 +3,20 @@
 #include <freertos/queue.h>
 #include <freertos/semphr.h>
 // Worker owns SD reads and JPEG decoding; only GUI owns LVGL objects.
-// Yield between bounded gallery work units; never change the audio task.
+// Yield on a time budget, not after every small read; never change audio.
+static TaskHandle_t photoExifTaskHandle=nullptr;
 static bool photoAudioBusy() {
     return wantPlayback.load() || (sdActive.load() && !sdPaused.load());
 }
 static void photoWorkPause() {
-    vTaskDelay(pdMS_TO_TICKS(photoAudioBusy()?4:1)+1);
+    // Separate clocks for the decoder and EXIF writer: each must yield to IDLE.
+    static uint32_t workerLast=0, writerLast=0;
+    uint32_t& last=(xTaskGetCurrentTaskHandle()==photoExifTaskHandle) ? writerLast : workerLast;
+    const bool busy=photoAudioBusy();
+    const uint32_t now=millis();
+    if(uint32_t(now-last)<(busy ? 5u : 10u)) return;
+    vTaskDelay(std::max(TickType_t(1),pdMS_TO_TICKS(busy ? 2u : 1u)));
+    last=millis();
 }
 static bool photoReadChunks(File& f,uint8_t* data,size_t bytes) {
     while(bytes) {
@@ -303,6 +311,7 @@ struct PhotoExifJob {int index,w,h;uint16_t* pixels;};
 static QueueHandle_t photoExifQueue=nullptr;
 static SemaphoreHandle_t photoFileMutex=nullptr;
 static void photoExifWriter(void*) {
+    photoExifTaskHandle=xTaskGetCurrentTaskHandle();
     PhotoExifJob job;
     for(;;) {
         if(xQueueReceive(photoExifQueue,&job,portMAX_DELAY)!=pdTRUE) continue;
@@ -328,7 +337,7 @@ static void photoDiskScan() {
         PhotoDiskRecord r{};f.seek(at);
         if(f.read((uint8_t*)&r,sizeof(r))!=sizeof(r) || !r.capacity || r.capacity>131072 || r.capacity>f.size()-at-sizeof(r)) break;
         r.path[255]=0;
-        photoDiskSlots.push_back({at,r});at+=sizeof(r)+r.capacity;vTaskDelay(1);
+        photoDiskSlots.push_back({at,r});at+=sizeof(r)+r.capacity;photoWorkPause();
     }
     f.close();
 }
