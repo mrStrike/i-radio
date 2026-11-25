@@ -27,7 +27,7 @@ const RadioStation BUILTIN_STATIONS[] = {
     {"Мария FM", "https://online.mariafm.ru:8443/MariaFM"},
     {"Маруся FM", "https://cdn.radio-holding.ru/marusya_default"},
     {"Маяк", "https://icecast-vgtrk.cdnvideo.ru/mayakfm_mp3_128kbps"},
-    {"Модель для сборки", "https://mds-station.com:8443/mds"},
+    {"Модель для сборки", "http://mds-station.com:8000/mds"},
     {"Москва FM", "https://icecast-vgtrk.cdnvideo.ru/moscowfm128"},
     {"Народное Радио", "https://rodniki.hostingradio.ru/rodniki32.aacp"},
     {"НАШЕ Радио", "https://nashe1.hostingradio.ru/nashe32.aacp"},

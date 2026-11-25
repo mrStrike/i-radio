@@ -48,6 +48,9 @@ static bool stationWrite(JsonDocument& d) {
 }
 static bool stationUrlMatches(int i,const String& url) {
     if(url==ALL_STATIONS[i].url)return true;
+    // Preserve saved favourites, alarm and last station after the MDS HTTP test.
+    if(String(ALL_STATIONS[i].url)=="http://mds-station.com:8000/mds" &&
+       url=="https://mds-station.com:8443/mds")return true;
     if(stationCatalogLoaded)for(JsonVariant v:stationDisk["stations"][i]["aliases"].as<JsonArray>())if(url==v.as<String>())return true;
     return false;
 }
@@ -70,6 +73,9 @@ static void stationCatalogInit() {
     ALL_STATIONS_COUNT=stationDisk["stations"].size();
     for(int i=0;i<ALL_STATIONS_COUNT;i++) {
         stationNames[i]=stationDisk["stations"][i]["name"].as<String>();stationUrls[i]=stationDisk["stations"][i]["url"].as<String>();
+        // Also apply the test to an existing SD catalogue, without rewriting it.
+        if(stationUrls[i]=="https://mds-station.com:8443/mds")
+            stationUrls[i]="http://mds-station.com:8000/mds";
         ALL_STATIONS[i]={stationNames[i].c_str(),stationUrls[i].c_str()};
     }
     stationCatalogLoaded=stationCatalogWritable=true;

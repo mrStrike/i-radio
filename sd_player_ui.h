@@ -114,8 +114,11 @@ static bool sdNaturalLess(const String& a, const String& b) {
 }
 // Each scan owns its clock, including recursive directory walks.
 static void sdScanPause(uint32_t& last) {
-    if(uint32_t(millis()-last)<10u) return;
-    vTaskDelay(1); // At least one tick so IDLE can run.
+    // Gallery first waits for this scan too. During playback, yield after
+    // every entry rather than issuing a burst of FAT calls for ten ms.
+    const bool busy=wantPlayback.load() || (sdActive.load() && !sdPaused.load());
+    if(!busy && uint32_t(millis()-last)<10u) return;
+    vTaskDelay(std::max(TickType_t(1),pdMS_TO_TICKS(busy ? 10u : 1u)));
     last=millis();
 }
 static void sdWalkBudget(const String& path, unsigned depth, uint32_t& last) {
@@ -177,9 +180,9 @@ static void sdLoadPlaylist() {
 static void sdScanTask(void*) {
     xSemaphoreTake(sdFilesMutex,portMAX_DELAY);
     sdFileCount.store(0);
-    SD_MMC.end(); sdMp3Files.clear(); sdFolders.clear(); sdScanLimited=false; sdCollectFolders=true;
+    sdMp3Files.clear(); sdFolders.clear(); sdScanLimited=false; sdCollectFolders=true;
     SD_MMC.setPins(38,40,39,41,48,47);
-    if(!SD_MMC.begin("/sdcard",false,false) || SD_MMC.cardType()==CARD_NONE) sdScanState.store(3);
+    if((SD_MMC.cardType()==CARD_NONE && !SD_MMC.begin("/sdcard",false,false)) || SD_MMC.cardType()==CARD_NONE) sdScanState.store(3);
     else {sdWalk("/",0); sdCollectFolders=false; sdLoadPlaylist(); if(!SD_MMC.exists("/.radio-playlist.txt")) sdSavePlaylist(); sdScanState.store(2);}
     sdFileCount.store(sdScanState.load()==2 ? int(sdMp3Files.size()) : 0);
     xSemaphoreGive(sdFilesMutex);

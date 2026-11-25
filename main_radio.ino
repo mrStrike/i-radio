@@ -38,6 +38,9 @@
 #include "stations.h"
 #include "station_catalog.h"
 
+// Diagnostics disabled; metadata callbacks below remain active.
+void audio_info(const char*) {}
+
 // Explicit prototype prevents Arduino from inserting it before RadioStation is known.
 static const RadioStation* selectedStation(int n);
 
@@ -48,6 +51,8 @@ static char nowTrack[256]{}, nowBroadcast[128]{}, nowDescription[256]{}, nowWebs
 static std::atomic<uint32_t> nowRate{0}, nowBitrate{0};
 static std::atomic<uint8_t> nowChannels{0};
 static std::atomic<bool> startupScreenReady{false};
+// HTTP starts only after GUI and audio driver have completed initialization.
+static std::atomic<bool> webStartupReady{false};
 static void storeNowText(char* destination, size_t capacity, const char* text) {
     portENTER_CRITICAL(&nowDataMux);
     strlcpy(destination, text ? text : "", capacity);
@@ -139,6 +144,7 @@ static void pushStatus(const char* text) {
     };
     e.type = UI_STATUS;
     strlcpy(e.text, text, sizeof(e.text));
+
     xQueueOverwrite(uiEventQueue, &e);
 
 }
@@ -611,9 +617,9 @@ static void touchRead(lv_indev_t*, lv_indev_data_t* data) {
     static int photoDx = 0, photoDy = 0;
     if (p && !tracking) {
         tracking = true; horizontal = false;
-        photoTouch = photoViewing && lv_screen_active() == galleryScreen && !volumePopupOpen;
+        photoTouch = photoViewing && lv_screen_active() == galleryScreen && !volumePopupOpen && !(x >= 194 && y <= 46);
         photoDx = photoDy = 0;
-        blockNavigation = (lv_screen_active() == localWifiScreen && localWifiEditor && !lv_obj_has_flag(localWifiEditor, LV_OBJ_FLAG_HIDDEN) && y >= 88) || scheduleTimePopupOpen || photoViewing || sdFolderPopupOpen || volumePopupOpen || (x >= 204 && y <= 38);
+        blockNavigation = (lv_screen_active() == localWifiScreen && localWifiEditor && !lv_obj_has_flag(localWifiEditor, LV_OBJ_FLAG_HIDDEN) && y >= 88) || scheduleTimePopupOpen || photoViewing || sdFolderPopupOpen || volumePopupOpen || (x >= 194 && y <= 46);
         startX = x; startY = y; startScreen = lv_screen_active();
         arbitrate = !blockNavigation && (startScreen == settingsScreen || startScreen == debugScreen || startScreen == localWifiScreen);
         controlTouch = false;
@@ -906,7 +912,8 @@ static void buildVolumePopup() {
     lv_obj_set_style_pad_all(button, 0, 0);
     lv_obj_set_style_bg_opa(button, LV_OPA_TRANSP, LV_PART_MAIN);
     lv_obj_remove_flag(button, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(button, openVolumePopup, LV_EVENT_CLICKED, nullptr);
+    lv_obj_set_ext_click_area(button, 10);
+    lv_obj_add_event_cb(button, openVolumePopup, LV_EVENT_PRESSED, nullptr);
     const int pixels[][4] = {{6,13,4,8},{10,11,2,12},{12,9,2,16},{14,7,2,20},{20,11,2,12},{24,8,2,18}};
     for (const auto& r : pixels) {
         lv_obj_t* pixel = mustCreate(button, "speakerPixel");
@@ -1302,6 +1309,8 @@ static void buildListScreen() {
             break;
         }
         lv_obj_remove_style_all(row);
+        lv_obj_set_layout(row, LV_LAYOUT_NONE);
+        lv_obj_set_flex_grow(row, 0);
         lv_obj_set_size(row, 216, 42);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_remove_flag(row, LV_OBJ_FLAG_SCROLLABLE);
@@ -1312,8 +1321,10 @@ static void buildListScreen() {
         }
         lv_obj_remove_style_all(btn);
         lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
-        lv_obj_set_size(btn, 178, 42);
-        lv_obj_set_pos(btn, 38, 0);
+        lv_obj_set_size(btn, 172, 42);
+        lv_obj_set_pos(btn, 44, 0);
+        lv_obj_set_ext_click_area(btn, 0);
+        lv_obj_remove_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_set_style_bg_color(btn, lv_color_hex(0x404040), 0);
         lv_obj_set_style_pad_all(btn, 0, 0);
         lv_obj_set_style_radius(btn, 0, 0);
@@ -1327,27 +1338,33 @@ static void buildListScreen() {
         lv_label_set_text(lbl, ALL_STATIONS[i].name);
         lv_obj_set_style_text_color(lbl, lv_color_hex(0xe0e0e0), 0);
         lv_obj_align(lbl, LV_ALIGN_LEFT_MID, 4, 0);
-        lv_obj_set_width(lbl, 148);
+        lv_obj_set_width(lbl, 142);
         lv_label_set_long_mode(lbl, LV_LABEL_LONG_MODE_DOTS);
         lv_obj_t* cb = lv_checkbox_create(row);
         if (!cb) fatal("Station checkbox allocation failed");
         favoriteChecks[i]=cb;
         lv_checkbox_set_text(cb, "");
         lv_obj_set_pos(cb,0,0);
-        lv_obj_set_size(cb, 34, 42);
-        lv_obj_set_style_pad_left(cb, 5, 0);
-        lv_obj_set_style_pad_top(cb, 10, 0);
+        // Reserve the whole left column for favorites. Keep the indicator
+        // inside that column even if the theme adds padding or a border.
+        lv_obj_set_size(cb, 44, 42);
+        lv_obj_set_ext_click_area(cb, 0);
+        lv_obj_set_style_bg_opa(cb, LV_OPA_TRANSP, LV_PART_MAIN);
+        lv_obj_set_style_border_width(cb, 0, LV_PART_MAIN);
+        lv_obj_set_style_pad_left(cb, 10, 0);
+        lv_obj_set_style_pad_top(cb, 11, 0);
+        lv_obj_set_style_pad_all(cb, 2, LV_PART_INDICATOR);
         lv_obj_set_style_pad_right(cb, 0, 0);
         lv_obj_set_style_pad_bottom(cb, 0, 0);
         for(int j=0;j<FAVORITES_COUNT;j++) if(favoriteIds[j]==i) lv_obj_add_state(cb,LV_STATE_CHECKED);
         // Use the native checkbox toggle; never bubble its tap to station playback.
-        lv_obj_remove_flag(cb, LV_OBJ_FLAG_EVENT_BUBBLE);
+        lv_obj_remove_flag(cb, static_cast<lv_obj_flag_t>(LV_OBJ_FLAG_EVENT_BUBBLE | LV_OBJ_FLAG_GESTURE_BUBBLE | LV_OBJ_FLAG_SCROLL_ON_FOCUS));
         lv_obj_add_flag(cb, LV_OBJ_FLAG_CLICKABLE);
         lv_obj_add_flag(cb, LV_OBJ_FLAG_CHECKABLE);
         lv_obj_remove_flag(cb, LV_OBJ_FLAG_SCROLLABLE);
         lv_obj_add_event_cb(cb,favoriteEvent,LV_EVENT_VALUE_CHANGED,(void*)uintptr_t(i));
         listIcons[i] = makePlayIcon(btn);
-        lv_obj_set_pos(listIcons[i], 157, 21);
+        lv_obj_set_pos(listIcons[i], 151, 21);
         setPlayIcon(listIcons[i], false);
     }
 }
@@ -1706,12 +1723,13 @@ void audio_task(void*) {
     audio.setAudioTaskCore(0);
 #endif
     if (!configureAudioPins(audio, 0)) fatal("I2S pinout failed");
-    // Ограничиваю сетевое подключение: HTTP — 1 с, HTTPS — 3 с.
+    // Ограничиваю сетевой вызов: HTTP и HTTPS — по 1 с.
     // DNS и внутренние операции платформы могут занимать дополнительное время.
-    audio.setConnectionTimeout(1000, 3000);
+    audio.setConnectionTimeout(1000, 1000);
     audio.forceMono(true);
     audio.setVolumeSteps(255);
     applyLinearVolume(audio, currentVolume.load());
+    webStartupReady.store(true);
 
     bool wasRunning = false;
     // Test WAV uses Audio's own driver, never a second I2S driver.
@@ -1856,7 +1874,7 @@ void audio_task(void*) {
     unsigned retryDelay=3000;
     uint32_t streamOpenedAt = 0;
     bool streamHadAudio = false;
-    constexpr uint32_t AUDIO_WAIT_MS = 12000;
+    constexpr uint32_t AUDIO_WAIT_MS = 5000;
     // Останавливаю ранее игравший поток до внутреннего reconnect (5–6 с).
     constexpr uint32_t AUDIO_STALL_MS = 4000;
     bool recoveryAllowed = false;
@@ -1873,12 +1891,27 @@ void audio_task(void*) {
         isPlaying = false;
 
         bool accepted = audio.connecttohost(url);
+        const uint32_t elapsed = millis() - streamOpenedAt;
+        if (accepted && elapsed >= AUDIO_WAIT_MS) {
+            audio.stopSong();
+            accepted = false;
+
+        }
+        // Команда, пришедшая во время синхронного вызова, имеет приоритет.
+        if (uxQueueMessagesWaiting(audioCmdQueue) || sdAction.load()) {
+            audio.stopSong();
+            streamOpenedAt = 0;
+            lastDecodedAudioAt.store(0);
+
+            return false;
+        }
 
         applyStreamVolume();
         if (!accepted) {
             streamOpenedAt = 0;
+            stoppedByTimer = true;
             if (!recoveryAllowed) wantPlayback = false;
-            pushStatus(recoveryAllowed ? "Нет соединения: повтор позже" : "Нет соединения: выберите станцию");
+            pushStatus(recoveryAllowed ? "Нет соединения: повтор позже" : "Ошибка подключения: нет ответа");
         } else {
             pushStatus("Ожидание аудиоданных...");
         }
@@ -2043,6 +2076,9 @@ void audio_task(void*) {
                 if(wantPlayback && !isPlaying) {
                     wantPlayback=false;
                     audio.stopSong();
+                    streamOpenedAt=0;
+                    stoppedByTimer=true;
+
                     pushStatus("Пауза");
                 }
                 else if (stoppedByTimer && currentStation >= 0) {
@@ -2160,7 +2196,6 @@ void audio_task(void*) {
         }
         uint32_t audioReference = decodedAt ? decodedAt : streamOpenedAt;
         if (wantPlayback && streamOpenedAt && millis() - audioReference >= (streamHadAudio ? AUDIO_STALL_MS : AUDIO_WAIT_MS)) {
-
             audio.stopSong();
             isPlaying = false;
             streamOpenedAt = 0;
@@ -2171,7 +2206,9 @@ void audio_task(void*) {
             // Восстановление сохраняю только для уже игравшего потока.
             if (!recoveryAllowed) {
                 wantPlayback = false;
-                pushStatus("Нет аудиоданных: выберите станцию");
+                stoppedByTimer = true;
+
+                pushStatus("Ошибка подключения: тайм-аут 5 с");
             } else {
                 pushStatus("Обрыв аудио: повтор позже");
             }
@@ -2439,25 +2476,39 @@ void gui_task(void*) {
     }
 }
 /* ---------- Колбэки метаданных ---------- */
+void audio_lasthost(const char*) {}
+void audio_bitrate(const char*) {}
+void audio_eof_stream(const char*) {}
+
 // Получаю уведомление об окончании файла для перехода к следующему треку.
 void audio_eof_mp3(const char* info) {
+
+
     if(sdActive.load()) sdEnded.store(true);
 
 }
 // Передаю полученное от сервера название станции в очередь метаданных.
 void audio_showstation(const char* info) {
 
+
+
     storeNowText(nowBroadcast, sizeof(nowBroadcast), info);
 }
 void audio_showstreamtitle(const char* info) {
+
+
 
     storeNowText(nowTrack, sizeof(nowTrack), info);
 }
 void audio_icydescription(const char* info) {
 
+
+
     storeNowText(nowDescription, sizeof(nowDescription), info);
 }
 void audio_icyurl(const char* info) {
+
+
 
     storeNowText(nowWebsite, sizeof(nowWebsite), info);
 }
@@ -2534,12 +2585,11 @@ static void showStartupLogo() {
 /* ---------- Setup ---------- */
 // Выполняю однократный запуск: оборудование, очереди, сохранённые настройки и сеть, затем создаю аудиозадачу на ядре 0 и GUI на ядре 1. Заставка выполняется в GUI после создания экранов, без ожидания сети.
 void setup() {
+    esp_log_level_set("*", ESP_LOG_NONE);
     pinMode(9, INPUT);
     analogSetPinAttenuation(9, ADC_11db);
     pinMode(PA_EN, OUTPUT);
     digitalWrite(PA_EN, LOW);
-    // Disable runtime ESP-IDF logging as well as compile-time Arduino logs.
-    esp_log_level_set("*", ESP_LOG_NONE);
     // Дисплей запускается перед прежней десятисекундной паузой.
     ledcAttach(TFT_BL, 5000, 8);
     ledcWrite(TFT_BL, 255);
@@ -2647,11 +2697,17 @@ void setup() {
 
     // Разделяю звук и графику по ядрам, сохраняя проверенные размеры стеков и приоритеты. Эти размеры — рабочий стек задач, не сетевой буфер.
     if (xTaskCreatePinnedToCore(audio_task, "audio", 20480, nullptr, 2, nullptr, 0) != pdPASS) fatal("audio task");
-    startWebRemote();
     if (xTaskCreatePinnedToCore(wifiSavedTask, "wifi_saved", 6144, nullptr, 1, nullptr, 0) != pdPASS) fatal("wifi saved task");
 
 }
 // Основная работа уже выполняется отдельными задачами. Здесь только освобождаю процессор задержкой, без дополнительного обслуживания Audio или LVGL.
 void loop() {
+    // Never block setup or start HTTP while GUI/audio allocate startup buffers.
+    // No dependency on Wi-Fi or station availability: offline startup works too.
+    static bool webStartAttempted = false;
+    if (!webStartAttempted && webStartupReady.load()) {
+        webStartAttempted = true;
+        startWebRemote();
+    }
     vTaskDelay(pdMS_TO_TICKS(1000));
 }

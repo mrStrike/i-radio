@@ -84,8 +84,14 @@ static int photoNextIndex=-1;
 static int photoCurrent=-1, photoLoading=-1;
 static uint32_t photoStarted=0;
 static uint32_t photoBackActivity=0;
+// Directory/cache discovery has a separate, conservative budget.
+// Yield between entries even when each individual FAT operation is quick.
+static void photoScanPause() {
+    vTaskDelay(std::max(TickType_t(1),pdMS_TO_TICKS(photoAudioBusy() ? 10u : 1u)));
+}
 static void photoWalk(const String& path,int depth) {
     if(depth>16 || photoFiles.size()>=1000) return;
+    photoScanPause();
     File dir=SD_MMC.open(path); if(!dir || !dir.isDirectory()) return;
     for(File f=dir.openNextFile();f;f=dir.openNextFile()) {
         String p=f.path(); bool folder=f.isDirectory(); f.close();
@@ -100,7 +106,7 @@ static void photoWalk(const String& path,int depth) {
         }
         if(folder) photoWalk(p,depth+1);
         else {String lower=p;lower.toLowerCase(); if(lower.endsWith(".jpg")||lower.endsWith(".jpeg")) photoFiles.push_back(p);}
-        photoWorkPause(); if(photoFiles.size()>=1000) break;
+        photoScanPause(); if(photoFiles.size()>=1000) break;
     }
 }
 // Read only JPEG markers, never allocate the complete compressed file.
@@ -337,7 +343,7 @@ static void photoDiskScan() {
         PhotoDiskRecord r{};f.seek(at);
         if(f.read((uint8_t*)&r,sizeof(r))!=sizeof(r) || !r.capacity || r.capacity>131072 || r.capacity>f.size()-at-sizeof(r)) break;
         r.path[255]=0;
-        photoDiskSlots.push_back({at,r});at+=sizeof(r)+r.capacity;photoWorkPause();
+        photoDiskSlots.push_back({at,r});at+=sizeof(r)+r.capacity;photoScanPause();
     }
     f.close();
 }
